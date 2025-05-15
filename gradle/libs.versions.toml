@@ -1,0 +1,57 @@
+[versions]
+agp = "8.10.0"
+cameraCore = "1.4.2"
+arcore = "1.48.0"
+core = "1.48.0"
+coreVersion = "1.44.0"
+kotlin = "2.0.21"
+coreKtx = "1.16.0"
+junit = "4.13.2"
+junitVersion = "1.2.1"
+espressoCore = "3.6.1"
+appcompat = "1.7.0"
+material = "1.12.0"
+opencvAndroid = "4.5.5"
+tensorflowLite = "2.16.1"
+tensorflowLiteGpu = "2.16.1"
+tensorflowLiteGpuDelegatePlugin = "0.4.0"
+tensorflowLiteMetadata = "0.4.4"
+tensorflowLiteSupport = "0.4.4"
+litertSupportApi = "1.2.0"
+tensorflowLiteSupportVersion = "0.4.4"
+tensorflowLiteVersion = "2.16.1"
+firebaseCrashlyticsBuildtools = "3.0.3"
+
+[libraries]
+core-v1440 = { module = "com.google.ar:core", version.ref = "coreVersion" }
+google-ar-core = { group = "com.google.ar", name = "core", version.ref = "arcore" }
+core = { module = "com.google.ar:core", version.ref = "core" }
+opencv-android = { module = "org.opencv:opencv-android", version.ref = "opencvAndroid" }
+tensorflow-lite-gpu-api = { module = "org.tensorflow:tensorflow-lite-gpu-api", version = "2.16.1" }
+androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "cameraCore" }
+androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "cameraCore" }
+androidx-camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "cameraCore" }
+androidx-camera-view = { module = "androidx.camera:camera-view", version.ref = "cameraCore" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+tensorflow-lite = { module = "org.tensorflow:tensorflow-lite", version.ref = "tensorflowLite" }
+tensorflow-lite-gpu = { module = "org.tensorflow:tensorflow-lite-gpu", version.ref = "tensorflowLite" }
+#tensorflow-lite-gpu-api = { module = "org.tensorflow:tensorflow-lite-gpu-api", version.ref = "tensorflowLiteGpu" }
+tensorflow-lite-gpu-delegate-plugin = { module = "org.tensorflow:tensorflow-lite-gpu-delegate-plugin", version.ref = "tensorflowLiteGpuDelegatePlugin" }
+tensorflow-lite-gpu-v2161 = { module = "org.tensorflow:tensorflow-lite-gpu", version.ref = "tensorflowLiteGpu" }
+tensorflow-lite-metadata = { module = "org.tensorflow:tensorflow-lite-metadata", version.ref = "tensorflowLiteSupport" }
+tensorflow-lite-metadata-v044 = { module = "org.tensorflow:tensorflow-lite-metadata", version.ref = "tensorflowLiteMetadata" }
+tensorflow-lite-support = { module = "org.tensorflow:tensorflow-lite-support", version.ref = "tensorflowLiteSupport" }
+litert-support-api = { group = "com.google.ai.edge.litert", name = "litert-support-api", version.ref = "litertSupportApi" }
+tensorflow-lite-support-v044 = { module = "org.tensorflow:tensorflow-lite-support", version.ref = "tensorflowLiteSupportVersion" }
+tensorflow-lite-v2161 = { module = "org.tensorflow:tensorflow-lite", version.ref = "tensorflowLiteVersion" }
+firebase-crashlytics-buildtools = { group = "com.google.firebase", name = "firebase-crashlytics-buildtools", version.ref = "firebaseCrashlyticsBuildtools" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+
