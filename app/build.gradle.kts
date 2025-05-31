@@ -55,5 +55,5 @@ dependencies {
     implementation(libs.tensorflow.lite.gpu.api)
     implementation(libs.tensorflow.lite.gpu.delegate.plugin)
     implementation(libs.core)
-//    implementation (libs.opencv.android)
+    implementation (libs.opencv)
 }

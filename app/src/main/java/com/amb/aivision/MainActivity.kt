@@ -1,10 +1,16 @@
 package com.amb.aivision
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.speech.tts.UtteranceProgressListener
 import android.os.Build
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.imgproc.Imgproc
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -20,6 +26,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import org.opencv.android.OpenCVLoader
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -33,6 +40,8 @@ import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.*
+private const val TAG = "DoorDetection"
+
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     companion object {
@@ -96,6 +105,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (OpenCVLoader.initLocal()) {
+            android.util.Log.d("OpenCV", "OpenCV loaded successfully")
+        } else {
+            android.util.Log.e("OpenCV", "Failed to load OpenCV")
+        }
         setContentView(R.layout.activity_main)
 
         previewView = findViewById(R.id.previewView)
@@ -200,7 +214,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 options.setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
                 options.setUseNNAPI(false)
             }
-            val model = FileUtil.loadMappedFile(this, "yolo12s.tflite")
+//            val model = FileUtil.loadMappedFile(this, "yolo12s.tflite")
+            val model = FileUtil.loadMappedFile(this, "best_float32 (1).tflite")
             tflite = Interpreter(model, options)
             numDetections = tflite.getOutputTensor(0).shape()[2]
 
@@ -273,6 +288,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return Bitmap.createBitmap(bitmap, leftX, topY, roiWidth, roiHeight)
     }
 
+    @SuppressLint("SetTextI18n")
     private fun toggleDetection() {
         shouldDetect = !shouldDetect
 
@@ -314,6 +330,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // Update the last detection time
         lastDetectionTime = currentTime
         canProcess = false
+
         try {
             // 1) Convert to bitmap & prepare input
             val bmp = image.toBitmapFromRGBA(reusableBitmap, reusableCanvas)
@@ -328,82 +345,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return
             }
 
-            // 3) Compute ROI coordinates
-            val w = bmp.width
-            val h = bmp.height
-            val roiWidth = w / 3
-            val roiHeight = h / 3
-            val leftX = when (position) {
-                "left" -> 0
-                "mid"  -> (w - roiWidth) / 2
-                else   -> w - roiWidth
-            }
-            val topY = (h - roiHeight) / 2
+            // 3) FIXED: Run depth estimation on FULL image to maintain coordinate consistency
+            val fullDepthMap = runDepthEstimation(bmp) // Use your existing function on full image
 
-            // 4) Crop ROI
-            val roi = Bitmap.createBitmap(bmp, leftX, topY, roiWidth, roiHeight)
+            // 4) FIXED: Get door depth using proper coordinates
+            val rawDoorDepth = avgDepthInBoxFixed(fullDepthMap, doorBox, bmp.width, bmp.height)
+            val doorDepthMeters = if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
+            Log.d(TAG, "onFrame: Door depth: $doorDepthMeters meters (raw: $rawDoorDepth)")
 
-            // 5) Run segmentation on ROI
-            val obstacles = runSegmentation(roi)
-            Log.d(TAG, "onFrame: Number of obstacles detected: ${obstacles.size}")
+            // 5) FIXED: Run segmentation on full image instead of ROI
+            val obstacles = runSegmentation(bmp) // Use your existing function on full image
 
-            // 6) Run MiDaS depth on ROI
-            val depthMap = runDepthEstimation(roi)
+            // 6) FIXED: Filter obstacles that are actually blocking the path
+            val blockingObstacles = obstacles.filter { obstacle ->
+                val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask, bmp.width, bmp.height)
+                val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
 
-            // 7) Compute door depth
-            val rawDoorDepth = avgDepthInBox(depthMap, doorBox, leftX, topY, roiWidth, roiHeight)
-            val doorDepth = if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
-            Log.d(TAG, "onFrame: Door depth: $doorDepth meters (raw: $rawDoorDepth)")
+                Log.d(TAG, "onFrame: Obstacle depth calculated: $obstacleDepthMeters meters (raw: $obstacleDepth)")
 
-            // 8) Compute each obstacle depth, store them, and check proximity
-            val obstacleDepths = mutableListOf<Float>()
-            val blocking = obstacles.any { obs ->
-                val rawD = avgMaskDepth(depthMap, obs.mask)
-                val d = if (rawD.isFinite()) DEPTH_SCALE_FACTOR / rawD else Float.MAX_VALUE
-                Log.d(TAG, "onFrame: Obstacle depth calculated: $d meters (raw: $rawD)")
-                obstacleDepths.add(d)
-                d < doorDepth && d < PROXIMITY_THRESHOLD_M
+                // Check if obstacle is closer than door AND within danger zone AND actually in path
+                obstacleDepthMeters < doorDepthMeters &&
+                        obstacleDepthMeters < PROXIMITY_THRESHOLD_M &&
+                        isObstacleInPath(obstacle.box, doorBox)
             }
 
-            // 9) Choose TTS guidance and append depth values
-            val msg = if (blocking) {
-                if (position == "mid") {
-                    // Check left region
-                    val leftRoi = cropROI(bmp, "left")
-                    val leftObstacles = runSegmentation(leftRoi)
-                    Log.d(TAG, "onFrame: Left region obstacles: ${leftObstacles.size}")
-                    if (leftObstacles.isEmpty()) {
-                        "The door is in front of you, but there is an obstacle. Move slightly left to avoid it, then continue forward."
-                    } else {
-                        // Check right region
-                        val rightRoi = cropROI(bmp, "right")
-                        val rightObstacles = runSegmentation(rightRoi)
-                        Log.d(TAG, "onFrame: Right region obstacles: ${rightObstacles.size}")
-                        if (rightObstacles.isEmpty()) {
-                            "The door is in front of you, but there is an obstacle. Move slightly right to avoid it, then continue forward."
-                        } else {
-                            "The door is in front of you, but there is no clear path to it."
-                        }
-                    }
-                } else {
-                    when (position) {
-                        "left"  -> "The door is on the left, but there is an obstacle. Move slightly right first, then take left."
-                        "right" -> "The door is on the right, but there is an obstacle. Move slightly left first, then take right."
-                        else    -> "The door is in front of you, but there is an obstacle. Move slightly left or right to avoid it, then continue forward."
-                    }
-                }
-            } else if (doorDepth < PROXIMITY_THRESHOLD_D) {
-                "You reached the door."
-            } else {
-                when (position) {
-                    "left"  -> "The door is slightly on the left."
-                    "right" -> "The door is slightly on the right."
-                    else    -> "The door is in front of you, move forward."
-                }
-            }
+            // 7) Generate navigation instruction
+            val msg = generateNavigationInstruction(doorBox, bmp.width, bmp.height, blockingObstacles, doorDepthMeters, position)
 
             speak(msg)
             runOnUiThread { positionTextView.text = msg }
+
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
             runOnUiThread { positionTextView.text = "Error: ${e.message}" }
@@ -411,6 +382,146 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             canProcess = true
         }
     }
+
+    // FIXED: Proper depth calculation for door box on full image
+    private fun avgDepthInBoxFixed(
+        depthMap: Array<FloatArray>,
+        box: RectF,
+        imageWidth: Int,
+        imageHeight: Int
+    ): Float {
+        var sum = 0f
+        var cnt = 0
+        val depthH = depthMap.size
+        val depthW = depthMap[0].size
+
+        // Convert door box coordinates to depth map coordinates
+        val startY = ((box.top / imageHeight) * depthH).toInt().coerceIn(0, depthH - 1)
+        val endY = ((box.bottom / imageHeight) * depthH).toInt().coerceIn(0, depthH - 1)
+        val startX = ((box.left / imageWidth) * depthW).toInt().coerceIn(0, depthW - 1)
+        val endX = ((box.right / imageWidth) * depthW).toInt().coerceIn(0, depthW - 1)
+
+        for (y in startY..endY) {
+            for (x in startX..endX) {
+                val depthValue = depthMap[y][x]
+                if (!depthValue.isNaN() && depthValue.isFinite()) {
+                    sum += depthValue
+                    cnt++
+                }
+            }
+        }
+        return if (cnt > 0) sum / cnt else Float.MAX_VALUE
+    }
+
+    // FIXED: Proper depth calculation for obstacle mask on full image
+    private fun avgMaskDepthFixed(
+        depthMap: Array<FloatArray>,
+        mask: Array<FloatArray>,
+        imageWidth: Int,
+        imageHeight: Int
+    ): Float {
+        var sum = 0f
+        var cnt = 0
+        val depthH = depthMap.size
+        val depthW = depthMap[0].size
+
+        // The mask is at 256x256, depth map is at 256x256, image is at 640x640
+        // We need to scale mask coordinates to match depth map coordinates
+        for (y in 0 until depthH) {
+            for (x in 0 until depthW) {
+                // Map depth coordinates to mask coordinates
+                val maskY = (y * mask.size / depthH).coerceIn(0, mask.size - 1)
+                val maskX = (x * mask[0].size / depthW).coerceIn(0, mask[0].size - 1)
+
+                if (mask[maskY][maskX] > 0.01f) {
+                    val depthValue = depthMap[y][x]
+                    if (!depthValue.isNaN() && depthValue.isFinite()) {
+                        sum += depthValue
+                        cnt++
+                    }
+                }
+            }
+        }
+        return if (cnt > 0) sum / cnt else Float.MAX_VALUE
+    }
+
+    // Check if obstacle is actually in the path to the door
+    private fun isObstacleInPath(obstacleBox: RectF, doorBox: RectF): Boolean {
+        // Check if obstacle horizontally overlaps with door area (with some margin)
+        val obstacleCenter = (obstacleBox.left + obstacleBox.right) / 2
+        val doorCenter = (doorBox.left + doorBox.right) / 2
+        val pathWidth = doorBox.width() * 1.5f // Add margin for path width
+
+        return abs(obstacleCenter - doorCenter) < pathWidth / 2
+    }
+
+    // Generate navigation instruction
+    private fun generateNavigationInstruction(
+        doorBox: RectF,
+        imageWidth: Int,
+        imageHeight: Int,
+        blockingObstacles: List<Obstacle>,
+        doorDepthMeters: Float,
+        position: String
+    ): String {
+        return when {
+            doorDepthMeters < PROXIMITY_THRESHOLD_D -> {
+                "You reached the door."
+            }
+
+            blockingObstacles.isNotEmpty() -> {
+                when (position) {
+                    "mid" -> {
+                        // For center position, suggest left or right based on clear space
+                        val hasLeftSpace = checkPathClear(doorBox, imageWidth, "left", blockingObstacles)
+                        val hasRightSpace = checkPathClear(doorBox, imageWidth, "right", blockingObstacles)
+
+                        when {
+                            hasLeftSpace && hasRightSpace ->
+                                "The door is in front of you, but there is an obstacle. You can move left or right to avoid it."
+                            hasLeftSpace ->
+                                "The door is in front of you, but there is an obstacle. Move slightly left to avoid it, then continue forward."
+                            hasRightSpace ->
+                                "The door is in front of you, but there is an obstacle. Move slightly right to avoid it, then continue forward."
+                            else ->
+                                "The door is in front of you, but there is no clear path to it."
+                        }
+                    }
+                    "left" -> "The door is on the left, but there is an obstacle. Move slightly right first, then take left."
+                    "right" -> "The door is on the right, but there is an obstacle. Move slightly left first, then take right."
+                    else -> "The door is ahead, but there is an obstacle. Move around it."
+                }
+            }
+
+            else -> {
+                when (position) {
+                    "left" -> "The door is slightly on the left."
+                    "right" -> "The door is slightly on the right."
+                    else -> "The door is in front of you, move forward."
+                }
+            }
+        }
+    }
+
+    // Check if path is clear in specified direction
+    private fun checkPathClear(
+        doorBox: RectF,
+        imageWidth: Int,
+        direction: String,
+        obstacles: List<Obstacle>
+    ): Boolean {
+        val checkZone = when (direction) {
+            "left" -> RectF(0f, doorBox.top, imageWidth * 0.4f, doorBox.bottom)
+            "right" -> RectF(imageWidth * 0.6f, doorBox.top, imageWidth.toFloat(), doorBox.bottom)
+            else -> return false
+        }
+
+        return obstacles.none { obstacle ->
+            RectF.intersects(obstacle.box, checkZone)
+        }
+    }
+
+
     private fun dilateArray(array: Array<FloatArray>, kernelSize: Int): Array<FloatArray> {
         val result = Array(array.size) { FloatArray(array[0].size) }
         val radius = kernelSize / 2
@@ -473,20 +584,92 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (bestDetection != null) {
             val rect = bestDetection.first
-            val centerX = (rect.left + rect.right) / 2
-            val normalizedX = centerX / bitmap.width
-            val position = when {
-                normalizedX < 0.33 -> "left"
-                normalizedX < 0.66 -> "mid"
-                else -> "right"
+            // Crop the bitmap to the detected bounding box
+            val croppedBitmap = cropBitmap(bitmap, rect)
+
+            // Confirm with classical methods
+            if (confirmDoorWithClassicalMethods(croppedBitmap)) {
+                val centerX = (rect.left + rect.right) / 2
+                val normalizedX = centerX / bitmap.width
+                val position = when {
+                    normalizedX < 0.33 -> "left"
+                    normalizedX < 0.66 -> "mid"
+                    else -> "right"
+                }
+                Log.d(TAG, "Door confirmed at position: $position, confidence: ${bestDetection.second}, box: $rect")
+                return Pair(rect, position)
+            } else {
+                Log.d(TAG, "Detected object is not a door")
             }
-            Log.d(TAG, "Door detected at position: $position, confidence: ${bestDetection.second}, box: $rect")
-            return Pair(rect, position)
         }
         Log.d(TAG, "No door detected")
         return Pair(null, "")
     }
 
+    // Helper function to crop the bitmap to the bounding box
+    private fun cropBitmap(bitmap: Bitmap, rect: RectF): Bitmap {
+        val left = rect.left.toInt().coerceIn(0, bitmap.width)
+        val top = rect.top.toInt().coerceIn(0, bitmap.height)
+        val right = rect.right.toInt().coerceIn(0, bitmap.width)
+        val bottom = rect.bottom.toInt().coerceIn(0, bitmap.height)
+        return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+    }
+
+    // Function to confirm door using classical methods
+    private fun confirmDoorWithClassicalMethods(bitmap: Bitmap): Boolean {
+        // Convert bitmap to OpenCV Mat
+        val mat = Mat()
+        Utils.bitmapToMat(bitmap, mat)
+
+        // Convert to grayscale
+        val gray = Mat()
+        Imgproc.cvtColor(mat, gray, Imgproc.COLOR_BGR2GRAY)
+
+        // Apply Canny Edge Detection
+        val edges = Mat()
+        Imgproc.Canny(gray, edges, 50.0, 150.0)
+
+        // Detect lines using Hough Transform
+        val lines = Mat()
+        Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180, 50, 50.0, 10.0)
+
+        // Check for vertical and horizontal lines
+        var verticalLines = 0
+        var horizontalLines = 0
+        for (i in 0 until lines.rows()) {
+            val line = lines.get(i, 0)
+            val x1 = line[0]
+            val y1 = line[1]
+            val x2 = line[2]
+            val y2 = line[3]
+            val angle = atan2(y2 - y1, x2 - x1) * 180 / Math.PI
+            if (abs(angle) < 10 || abs(angle - 180) < 10) horizontalLines++
+            if (abs(angle - 90) < 10 || abs(angle + 90) < 10) verticalLines++
+        }
+
+        // Find contours
+        val contours = mutableListOf<MatOfPoint>()
+        val hierarchy = Mat()
+        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        // Analyze contours for quadrilateral shapes
+        for (contour in contours) {
+            val approx = MatOfPoint2f()
+            Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true) * 0.02, true)
+            if (approx.toArray().size == 4) { // Quadrilateral
+                val points = approx.toArray()
+                val rect = Imgproc.boundingRect(MatOfPoint(*points))
+                val aspectRatio = rect.height.toFloat() / rect.width
+                if (aspectRatio >= 1.5 && aspectRatio <= 3.0) {
+                    // Check if there are lines forming a frame
+                    if (verticalLines >= 2 && horizontalLines >= 2) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
     // ---- Segmentation ----
     data class Obstacle(val box: RectF, val mask: Array<FloatArray>)
 
