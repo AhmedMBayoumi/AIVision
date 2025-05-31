@@ -866,7 +866,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             sum += intensity
         }
         val mean = sum / pixels.size
-        var variance = 0.0
+        var variance = 0.6
         for (intensity in intensities) {
             val diff = intensity - mean
             variance += diff * diff
