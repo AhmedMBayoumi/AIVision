@@ -2,12 +2,15 @@ package com.amb.aivision
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -36,6 +39,9 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -47,6 +53,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
+        private const val STORAGE_PERMISSION_CODE = 1002
         private const val PROCESSING_SIZE = 256           // for both seg & depth
         private const val PROXIMITY_THRESHOLD_M = 2.0f    // 2 meters
         private const val PROXIMITY_THRESHOLD_D = 0.075f
@@ -124,16 +131,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         detectButton.setOnClickListener { toggleDetection() }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCamera()
-        } else {
+        val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        val permissionsNeeded = permissionsToRequest.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (permissionsNeeded.isNotEmpty()) {
             ActivityCompat.requestPermissions(
                 this,
-                arrayOf(Manifest.permission.CAMERA),
+                permissionsNeeded.toTypedArray(),
                 CAMERA_PERMISSION_CODE
             )
+        } else {
+            startCamera()
         }
     }
 
@@ -358,6 +370,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    @SuppressLint("SetTextI18n")
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
         if (!shouldDetect || !canProcess) {
@@ -372,8 +385,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         lastDetectionTime = currentTime
         canProcess = false
         try {
-            val bmp = image.toBitmapFromRGBA(reusableBitmap, reusableCanvas)
+            val bmp = image.toBitmap() // Changed from image.toBitmapFromRGBA(reusableBitmap, reusableCanvas)
             image.close()
+
 
             // Check if the full image is mostly uniform
             if (isImageMostlyUniform(bmp)) {
@@ -883,30 +897,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tts.speak(msg, TextToSpeech.QUEUE_FLUSH, params, "messageId")
     }
 
-    private fun ImageProxy.toBitmapFromRGBA(reusableBitmap: Bitmap, canvas: Canvas): Bitmap {
-        val buffer = planes[0].buffer
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        bitmap.copyPixelsFromBuffer(buffer)
-        canvas.drawBitmap(
-            bitmap,
-            Rect(0, 0, bitmap.width, bitmap.height),
-            Rect(0, 0, reusableBitmap.width, reusableBitmap.height),
-            null
-        )
-        if (bitmap != reusableBitmap) {
-            bitmap.recycle()
-        }
-        return reusableBitmap
-    }
+
 
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == CAMERA_PERMISSION_CODE &&
-            grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCamera()
+        if (requestCode == CAMERA_PERMISSION_CODE) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                startCamera()
+            } else {
+                Log.e(TAG, "Required permissions denied")
+                runOnUiThread { positionTextView.text = "Camera and/or storage permission denied" }
+            }
         }
     }
 
