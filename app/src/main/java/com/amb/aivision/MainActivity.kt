@@ -4,17 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.*
-import android.speech.tts.UtteranceProgressListener
 import android.os.Build
-import org.opencv.android.Utils
-import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
-import org.opencv.core.MatOfPoint2f
-import org.opencv.imgproc.Imgproc
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.view.WindowManager
 import android.widget.Button
@@ -27,10 +22,13 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
-import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -40,6 +38,7 @@ import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.*
+
 private const val TAG = "DoorDetection"
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
@@ -50,18 +49,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val PROXIMITY_THRESHOLD_M = 2.0f    // 2 meters
         private const val PROXIMITY_THRESHOLD_D = 0.075f
         private const val DETECTION_RESOLUTION = 640      // For door detection
-        private const val TAG = "SegmentationDebug"       // For logging
         private const val DEPTH_SCALE_FACTOR = 69.375f    // For MiDaS depth to meters
-        private const val DETECTION_INTERVAL_MS = 3000L   // 2 seconds
-
-        private var lastDetectionTime = 0L // Add this new variable
+        private const val DETECTION_INTERVAL_MS = 3000L   // 3 seconds
     }
 
     private lateinit var previewView: PreviewView
     private lateinit var positionTextView: TextView
     private lateinit var detectButton: Button
 
-    private var lastDetectionTime = 0L // Add this new variable
+    private var lastDetectionTime = 0L
     private var isSpeaking = false
 
     private lateinit var tts: TextToSpeech
@@ -69,13 +65,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var canProcess = true
 
     private lateinit var tflite: Interpreter // For YOLO door detection
-    private var gpuDelegate: GpuDelegate? = null
-
     private lateinit var segInterpreter: Interpreter
-    private var segGpuDelegate: GpuDelegate? = null
-
     private lateinit var depthInterpreter: Interpreter
-    private var depthGpuDelegate: GpuDelegate? = null
 
     private lateinit var detectionProcessor: ImageProcessor
     private lateinit var imageProcessor: ImageProcessor
@@ -106,9 +97,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (OpenCVLoader.initLocal()) {
-            android.util.Log.d("OpenCV", "OpenCV loaded successfully")
+            Log.d("OpenCV", "OpenCV loaded successfully")
         } else {
-            android.util.Log.e("OpenCV", "Failed to load OpenCV")
+            Log.e("OpenCV", "Failed to load OpenCV")
         }
         setContentView(R.layout.activity_main)
 
@@ -119,7 +110,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         setupFullscreenUI()
         setupProcessors()
         if (!loadModels()) {
-            finish()
+            positionTextView.text = "Failed to load models. Please check the app configuration."
+            detectButton.isEnabled = false // Disable detection until models are loaded
             return
         }
 
@@ -140,12 +132,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts.language = Locale.US
-
-            // Add a UtteranceProgressListener to track speaking status
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     isSpeaking = true
@@ -166,6 +155,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Log.e(TAG, "TTS initialization failed")
         }
     }
+
     private fun setupFullscreenUI() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -204,41 +194,51 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun loadModels(): Boolean {
         try {
             // Door detection model
-            val compatList = CompatibilityList()
-            val options = Interpreter.Options()
-            if (compatList.isDelegateSupportedOnThisDevice) {
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                gpuDelegate = GpuDelegate(delegateOptions)
-                options.addDelegate(gpuDelegate)
-            } else {
-                options.setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
-                options.setUseNNAPI(false)
+            val options = Interpreter.Options().apply {
+                setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
+                setUseNNAPI(false)
             }
-//            val model = FileUtil.loadMappedFile(this, "yolo12s.tflite")
-            val model = FileUtil.loadMappedFile(this, "best_float32 (1).tflite")
+            val model = try {
+                FileUtil.loadMappedFile(this, "best(2)_float32.tflite")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load YOLO model: ${e.message}", e)
+                runOnUiThread {
+                    positionTextView.text = "Error loading YOLO model: ${e.message}"
+                }
+                return false
+            }
             tflite = Interpreter(model, options)
             numDetections = tflite.getOutputTensor(0).shape()[2]
 
             // Segmentation model
-            FileUtil.loadMappedFile(this, "yolo11s-seg.tflite").let { mapped ->
-                val opt = Interpreter.Options().apply {
-                    val gpu = GpuDelegate()
-                    addDelegate(gpu).also { segGpuDelegate = gpu }
+            val segModel = try {
+                FileUtil.loadMappedFile(this, "yolo11s-seg.tflite")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load segmentation model: ${e.message}", e)
+                runOnUiThread {
+                    positionTextView.text = "Error loading segmentation model: ${e.message}"
                 }
-                segInterpreter = Interpreter(mapped, opt)
+                return false
             }
+            segInterpreter = Interpreter(segModel, options)
 
             // Depth model
-            FileUtil.loadMappedFile(this, "MiDas.tflite").let { mapped ->
-                val opt = Interpreter.Options().apply {
-                    val gpu = GpuDelegate()
-                    addDelegate(gpu).also { depthGpuDelegate = gpu }
+            val depthModel = try {
+                FileUtil.loadMappedFile(this, "MiDas.tflite")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load depth model: ${e.message}", e)
+                runOnUiThread {
+                    positionTextView.text = "Error loading depth model: ${e.message}"
                 }
-                depthInterpreter = Interpreter(mapped, opt)
+                return false
             }
+            depthInterpreter = Interpreter(depthModel, options)
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load models: ${e.message}", e)
+            runOnUiThread {
+                positionTextView.text = "Error loading models: ${e.message}"
+            }
             return false
         }
     }
@@ -273,28 +273,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun cropROI(bitmap: Bitmap, position: String): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        val roiWidth = w / 3
-        val roiHeight = h / 3
-        val leftX = when (position) {
-            "left" -> 0
-            "mid"  -> (w - roiWidth) / 2
-            else   -> w - roiWidth
-        }
-        val topY = (h - roiHeight) / 2
-        Log.d(TAG, "cropROI: position=$position, leftX=$leftX, topY=$topY, roiWidth=$roiWidth, roiHeight=$roiHeight")
-        return Bitmap.createBitmap(bitmap, leftX, topY, roiWidth, roiHeight)
-    }
-
     @SuppressLint("SetTextI18n")
     private fun toggleDetection() {
         shouldDetect = !shouldDetect
-
         if (shouldDetect) {
             detectButton.text = "Stop detecting doors"
-            // No need for handler.post here - detection will happen through onFrame
             Log.d(TAG, "Started continuous detection")
         } else {
             detectButton.text = "Detect Door"
@@ -305,38 +288,37 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun triggerDetection() {
         if (canProcess && shouldDetect) {
-            shouldDetect = true // Ensure onFrame processes the frame
+            shouldDetect = true
             Log.d(TAG, "Triggered detection")
         }
     }
 
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
-
-        // Check if we should process this frame
         if (!shouldDetect || !canProcess) {
             image.close()
             return
         }
-
-        // Check if enough time has passed since the last detection
-        // AND check that TTS is not currently speaking
         if (currentTime - lastDetectionTime < DETECTION_INTERVAL_MS || isSpeaking) {
             Log.d(TAG, "Skipping frame processing - Time since last: ${currentTime - lastDetectionTime}ms, TTS speaking: $isSpeaking")
             image.close()
             return
         }
-
-        // Update the last detection time
         lastDetectionTime = currentTime
         canProcess = false
-
         try {
-            // 1) Convert to bitmap & prepare input
             val bmp = image.toBitmapFromRGBA(reusableBitmap, reusableCanvas)
             image.close()
 
-            // 2) Run door detection to get `doorBox: RectF?` and `position: String`
+            // Check if the full image is mostly uniform
+            if (isImageMostlyUniform(bmp)) {
+                val msg = "You are going to hit something."
+                speak(msg)
+                runOnUiThread { positionTextView.text = msg }
+                canProcess = true
+                return
+            }
+
             val (doorBox, position) = detectDoor(bmp)
             if (doorBox == null) {
                 speak("No door detected, please move around")
@@ -344,37 +326,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 canProcess = true
                 return
             }
-
-            // 3) FIXED: Run depth estimation on FULL image to maintain coordinate consistency
-            val fullDepthMap = runDepthEstimation(bmp) // Use your existing function on full image
-
-            // 4) FIXED: Get door depth using proper coordinates
+            val fullDepthMap = runDepthEstimation(bmp)
             val rawDoorDepth = avgDepthInBoxFixed(fullDepthMap, doorBox, bmp.width, bmp.height)
             val doorDepthMeters = if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
             Log.d(TAG, "onFrame: Door depth: $doorDepthMeters meters (raw: $rawDoorDepth)")
-
-            // 5) FIXED: Run segmentation on full image instead of ROI
-            val obstacles = runSegmentation(bmp) // Use your existing function on full image
-
-            // 6) FIXED: Filter obstacles that are actually blocking the path
+            val obstacles = runSegmentation(bmp)
             val blockingObstacles = obstacles.filter { obstacle ->
                 val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask, bmp.width, bmp.height)
                 val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
-
                 Log.d(TAG, "onFrame: Obstacle depth calculated: $obstacleDepthMeters meters (raw: $obstacleDepth)")
-
-                // Check if obstacle is closer than door AND within danger zone AND actually in path
                 obstacleDepthMeters < doorDepthMeters &&
                         obstacleDepthMeters < PROXIMITY_THRESHOLD_M &&
                         isObstacleInPath(obstacle.box, doorBox)
             }
-
-            // 7) Generate navigation instruction
             val msg = generateNavigationInstruction(doorBox, bmp.width, bmp.height, blockingObstacles, doorDepthMeters, position)
-
             speak(msg)
             runOnUiThread { positionTextView.text = msg }
-
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
             runOnUiThread { positionTextView.text = "Error: ${e.message}" }
@@ -383,7 +350,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    // FIXED: Proper depth calculation for door box on full image
     private fun avgDepthInBoxFixed(
         depthMap: Array<FloatArray>,
         box: RectF,
@@ -394,13 +360,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         var cnt = 0
         val depthH = depthMap.size
         val depthW = depthMap[0].size
-
-        // Convert door box coordinates to depth map coordinates
         val startY = ((box.top / imageHeight) * depthH).toInt().coerceIn(0, depthH - 1)
         val endY = ((box.bottom / imageHeight) * depthH).toInt().coerceIn(0, depthH - 1)
         val startX = ((box.left / imageWidth) * depthW).toInt().coerceIn(0, depthW - 1)
         val endX = ((box.right / imageWidth) * depthW).toInt().coerceIn(0, depthW - 1)
-
         for (y in startY..endY) {
             for (x in startX..endX) {
                 val depthValue = depthMap[y][x]
@@ -413,7 +376,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return if (cnt > 0) sum / cnt else Float.MAX_VALUE
     }
 
-    // FIXED: Proper depth calculation for obstacle mask on full image
     private fun avgMaskDepthFixed(
         depthMap: Array<FloatArray>,
         mask: Array<FloatArray>,
@@ -424,15 +386,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         var cnt = 0
         val depthH = depthMap.size
         val depthW = depthMap[0].size
-
-        // The mask is at 256x256, depth map is at 256x256, image is at 640x640
-        // We need to scale mask coordinates to match depth map coordinates
         for (y in 0 until depthH) {
             for (x in 0 until depthW) {
-                // Map depth coordinates to mask coordinates
                 val maskY = (y * mask.size / depthH).coerceIn(0, mask.size - 1)
                 val maskX = (x * mask[0].size / depthW).coerceIn(0, mask[0].size - 1)
-
                 if (mask[maskY][maskX] > 0.01f) {
                     val depthValue = depthMap[y][x]
                     if (!depthValue.isNaN() && depthValue.isFinite()) {
@@ -445,17 +402,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return if (cnt > 0) sum / cnt else Float.MAX_VALUE
     }
 
-    // Check if obstacle is actually in the path to the door
     private fun isObstacleInPath(obstacleBox: RectF, doorBox: RectF): Boolean {
-        // Check if obstacle horizontally overlaps with door area (with some margin)
         val obstacleCenter = (obstacleBox.left + obstacleBox.right) / 2
         val doorCenter = (doorBox.left + doorBox.right) / 2
-        val pathWidth = doorBox.width() * 1.5f // Add margin for path width
-
+        val pathWidth = doorBox.width() * 1.5f
         return abs(obstacleCenter - doorCenter) < pathWidth / 2
     }
 
-    // Generate navigation instruction
     private fun generateNavigationInstruction(
         doorBox: RectF,
         imageWidth: Int,
@@ -468,14 +421,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             doorDepthMeters < PROXIMITY_THRESHOLD_D -> {
                 "You reached the door."
             }
-
             blockingObstacles.isNotEmpty() -> {
                 when (position) {
                     "mid" -> {
-                        // For center position, suggest left or right based on clear space
                         val hasLeftSpace = checkPathClear(doorBox, imageWidth, "left", blockingObstacles)
                         val hasRightSpace = checkPathClear(doorBox, imageWidth, "right", blockingObstacles)
-
                         when {
                             hasLeftSpace && hasRightSpace ->
                                 "The door is in front of you, but there is an obstacle. You can move left or right to avoid it."
@@ -492,7 +442,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     else -> "The door is ahead, but there is an obstacle. Move around it."
                 }
             }
-
             else -> {
                 when (position) {
                     "left" -> "The door is slightly on the left."
@@ -503,7 +452,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Check if path is clear in specified direction
     private fun checkPathClear(
         doorBox: RectF,
         imageWidth: Int,
@@ -515,17 +463,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "right" -> RectF(imageWidth * 0.6f, doorBox.top, imageWidth.toFloat(), doorBox.bottom)
             else -> return false
         }
-
         return obstacles.none { obstacle ->
             RectF.intersects(obstacle.box, checkZone)
         }
     }
 
-
     private fun dilateArray(array: Array<FloatArray>, kernelSize: Int): Array<FloatArray> {
         val result = Array(array.size) { FloatArray(array[0].size) }
         val radius = kernelSize / 2
-
         for (y in array.indices) {
             for (x in array[0].indices) {
                 var value = 0f
@@ -544,23 +489,40 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return result
     }
 
-    // ---- Door detection ----
     private fun detectDoor(bitmap: Bitmap): Pair<RectF?, String> {
         val tensorImage = TensorImage(DataType.FLOAT32)
         tensorImage.load(bitmap)
         val processedImage = detectionProcessor.process(tensorImage)
-
         val inputBuffer = processedImage.buffer
         inputBuffer.rewind()
-
-        // Run model
         val outputs = Array(1) { Array(5) { FloatArray(8400) } }
         tflite.run(inputBuffer, outputs)
-
-        // Detection logic for highest probability
-        val threshold = 0.6f
+        val threshold = 0.0f
         var bestDetection: Pair<RectF, Float>? = null
         var maxConfidence = -1f
+
+        // Log all detections above threshold
+        Log.d(TAG, "YOLO Model Output: Printing detections with confidence > $threshold")
+        for (i in 0 until 8400) {
+            val x = outputs[0][0][i]
+            val y = outputs[0][1][i]
+            val w = outputs[0][2][i]
+            val h = outputs[0][3][i]
+            val confidence = outputs[0][4][i]
+            if (confidence > threshold) {
+                val centerX = x * bitmap.width
+                val centerY = y * bitmap.height
+                val widthScaled = w * bitmap.width
+                val heightScaled = h * bitmap.height
+                val left = centerX - widthScaled / 2
+                val top = centerY - heightScaled / 2
+                val right = centerX + widthScaled / 2
+                val bottom = centerY + heightScaled / 2
+                Log.d(TAG, "Detection $i: Confidence=$confidence, Box=[left=$left, top=$top, right=$right, bottom=$bottom]")
+            }
+        }
+
+        // Select the best detection
         for (i in 0 until 8400) {
             val x = outputs[0][0][i]
             val y = outputs[0][1][i]
@@ -581,13 +543,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 maxConfidence = confidence
             }
         }
-
         if (bestDetection != null) {
             val rect = bestDetection.first
-            // Crop the bitmap to the detected bounding box
             val croppedBitmap = cropBitmap(bitmap, rect)
-
-            // Confirm with classical methods
             if (confirmDoorWithClassicalMethods(croppedBitmap)) {
                 val centerX = (rect.left + rect.right) / 2
                 val normalizedX = centerX / bitmap.width
@@ -606,7 +564,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return Pair(null, "")
     }
 
-    // Helper function to crop the bitmap to the bounding box
     private fun cropBitmap(bitmap: Bitmap, rect: RectF): Bitmap {
         val left = rect.left.toInt().coerceIn(0, bitmap.width)
         val top = rect.top.toInt().coerceIn(0, bitmap.height)
@@ -615,25 +572,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
     }
 
-    // Function to confirm door using classical methods
     private fun confirmDoorWithClassicalMethods(bitmap: Bitmap): Boolean {
-        // Convert bitmap to OpenCV Mat
         val mat = Mat()
         Utils.bitmapToMat(bitmap, mat)
-
-        // Convert to grayscale
         val gray = Mat()
         Imgproc.cvtColor(mat, gray, Imgproc.COLOR_BGR2GRAY)
-
-        // Apply Canny Edge Detection
         val edges = Mat()
         Imgproc.Canny(gray, edges, 50.0, 150.0)
-
-        // Detect lines using Hough Transform
         val lines = Mat()
         Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180, 50, 50.0, 10.0)
-
-        // Check for vertical and horizontal lines
         var verticalLines = 0
         var horizontalLines = 0
         for (i in 0 until lines.rows()) {
@@ -646,22 +593,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (abs(angle) < 10 || abs(angle - 180) < 10) horizontalLines++
             if (abs(angle - 90) < 10 || abs(angle + 90) < 10) verticalLines++
         }
-
-        // Find contours
         val contours = mutableListOf<MatOfPoint>()
         val hierarchy = Mat()
         Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-        // Analyze contours for quadrilateral shapes
         for (contour in contours) {
             val approx = MatOfPoint2f()
             Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true) * 0.02, true)
-            if (approx.toArray().size == 4) { // Quadrilateral
+            if (approx.toArray().size == 4) {
                 val points = approx.toArray()
                 val rect = Imgproc.boundingRect(MatOfPoint(*points))
                 val aspectRatio = rect.height.toFloat() / rect.width
                 if (aspectRatio >= 1.5 && aspectRatio <= 3.0) {
-                    // Check if there are lines forming a frame
                     if (verticalLines >= 2 && horizontalLines >= 2) {
                         return true
                     }
@@ -670,34 +612,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         return false
     }
-    // ---- Segmentation ----
+
     data class Obstacle(val box: RectF, val mask: Array<FloatArray>)
 
     private fun runSegmentation(roi: Bitmap): List<Obstacle> {
         try {
-            // 1) Preprocess
             Log.d(TAG, "runSegmentation: ROI dimensions: ${roi.width}x${roi.height}")
             val ti = TensorImage(DataType.FLOAT32)
             ti.load(roi)
             val input = imageProcessor.process(ti).buffer
             val inputArray = FloatArray(input.capacity() / 4).apply { input.asFloatBuffer().get(this) }
             Log.d(TAG, "runSegmentation: Input pixel range: min=${inputArray.minOrNull()}, max=${inputArray.maxOrNull()}")
-
-            // 2) Allocate outputs based on model shapes
             val detShape = segInterpreter.getOutputTensor(0).shape()
             val protoShape = segInterpreter.getOutputTensor(1).shape()
-            Log.d(TAG, "runSegmentation: Detection output shape: ${detShape.contentToString()}")
-            Log.d(TAG, "runSegmentation: Proto output shape: ${protoShape.contentToString()}")
-
+            Log.d(TAG, "runSegmentation: Detection output shape: ${detShape.joinToString()}")
+            Log.d(TAG, "runSegmentation: Proto output shape: ${protoShape.joinToString()}")
             val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
             val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
             val outputs = mapOf(0 to detOut, 1 to protoOut)
-
-            // 3) Run inference
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
             Log.d(TAG, "runSegmentation: Model inference completed")
-
-            // 4) Parse detections
             val raw = detOut[0]
             Log.d(TAG, "runSegmentation: Raw detections attributes: ${raw.size}, detections: ${raw[0].size}")
             val dets = mutableListOf<Pair<RectF, FloatArray>>()
@@ -706,13 +640,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
             Log.d(TAG, "runSegmentation: numClasses=$numClasses, maskCoefsStartIdx=$maskCoefsStartIdx, maskCoefsCount=$maskCoefsCount")
-
             if (maskCoefsStartIdx + maskCoefsCount > detShape[1]) {
                 Log.e(TAG, "Invalid mask coefficients range: start=$maskCoefsStartIdx, count=$maskCoefsCount, max=${detShape[1]}")
                 return emptyList()
             }
-
-            // Collect all confidences for top 10
             val confidences = mutableListOf<Float>()
             for (i in 0 until detShape[2]) {
                 var maxClassProb = 0f
@@ -724,7 +655,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             val topConfidences = confidences.sortedDescending().take(10)
             Log.d(TAG, "runSegmentation: Top 10 confidences: ${topConfidences.joinToString()}")
-
             for (i in 0 until detShape[2]) {
                 var maxClassProb = 0f
                 var maxClassIdx = -1
@@ -735,40 +665,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         maxClassIdx = c
                     }
                 }
-
                 if (maxClassProb > threshold) {
                     val cx = raw[0][i] * roi.width
                     val cy = raw[1][i] * roi.height
                     val ww = raw[2][i] * roi.width
                     val hh = raw[3][i] * roi.height
                     val box = RectF(cx - ww/2, cy - hh/2, cx + ww/2, cy + hh/2)
-
                     val maskCoefs = FloatArray(maskCoefsCount) { c ->
                         val idx = maskCoefsStartIdx + c
                         if (idx < detShape[1]) raw[idx][i] else 0f
                     }
-
                     Log.d(TAG, "Detection $i: class=$maxClassIdx, conf=$maxClassProb, box=$box, coefs min=${maskCoefs.minOrNull()}, max=${maskCoefs.maxOrNull()}")
                     dets += box to maskCoefs
                 }
             }
             Log.d(TAG, "runSegmentation: Detections after confidence threshold ($threshold): ${dets.size}")
-
             val final = applyNMS(dets, 0.4f)
             Log.d(TAG, "runSegmentation: Detections after NMS: ${final.size}")
-
-            // 5) Build masks at 256x256 resolution
             val obstacles = mutableListOf<Obstacle>()
             val protoH = protoShape[1]
             val protoW = protoShape[2]
             val protoC = protoShape[3]
-
             for ((box, coefs) in final) {
                 try {
                     val mask = Array(256) { FloatArray(256) }
                     val maskValues = mutableListOf<Float>()
                     var activePixels = 0
-
                     for (dy in 0 until 256) {
                         for (dx in 0 until 256) {
                             val py = (dy * protoH / 256).toInt().coerceIn(0, protoH - 1)
@@ -785,19 +707,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                             }
                         }
                     }
-
                     Log.d(TAG, "Mask for box $box: values min=${maskValues.minOrNull()}, max=${maskValues.maxOrNull()}, active pixels=$activePixels")
-
                     val dilatedMask = dilateArray(mask, 3)
                     val activeAfter = dilatedMask.sumBy { row -> row.count { it > 0f } }
                     Log.d(TAG, "Mask pixels: before=$activePixels, after dilation=$activeAfter")
-
                     obstacles.add(Obstacle(box, dilatedMask))
                 } catch (e: Exception) {
                     Log.e(TAG, "Error building mask: ${e.message}", e)
                 }
             }
-
             return obstacles
         } catch (e: Exception) {
             Log.e(TAG, "Segmentation error: ${e.message}", e)
@@ -830,7 +748,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return if (ua > 0) inter / ua else 0f
     }
 
-    // ---- Depth estimation ----
     private fun runDepthEstimation(bmp: Bitmap): Array<FloatArray> {
         try {
             Log.d(TAG, "runDepthEstimation: Input bitmap dimensions: ${bmp.width}x${bmp.height}")
@@ -838,7 +755,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             ti.load(bmp)
             val input = depthProcessor.process(ti).buffer
             val outShape = depthInterpreter.getOutputTensor(0).shape()
-            Log.d(TAG, "runDepthEstimation: Output shape: ${outShape.contentToString()}")
+            Log.d(TAG, "runDepthEstimation: Output shape: ${outShape.joinToString()}")
             val depthMap = if (outShape.size == 4) {
                 val raw = Array(outShape[0]) { Array(outShape[1]) { Array(outShape[2]) { FloatArray(outShape[3]) } } }
                 depthInterpreter.run(input, raw)
@@ -848,7 +765,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 depthInterpreter.run(input, raw)
                 raw[0]
             } else {
-                Log.e(TAG, "Unsupported depth output shape: ${outShape.contentToString()}")
+                Log.e(TAG, "Unsupported depth output shape: ${outShape.joinToString()}")
                 Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) { Float.MAX_VALUE } }
             }
             var minDepth = Float.MAX_VALUE
@@ -867,54 +784,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Compute avg depth inside door box
-    private fun avgDepthInBox(
-        depth: Array<FloatArray>,
-        box: RectF,
-        roiLeft: Int,
-        roiTop: Int,
-        roiWidth: Int,
-        roiHeight: Int
-    ): Float {
-        var sum = 0f
-        var cnt = 0
-        val depthH = depth.size
-        val depthW = depth[0].size
-        for (y in 0 until depthH) {
-            for (x in 0 until depthW) {
-                val fullX = (x.toFloat() / (depthW - 1)) * (roiWidth - 1) + roiLeft
-                val fullY = (y.toFloat() / (depthH - 1)) * (roiHeight - 1) + roiTop
-                if (box.contains(fullX, fullY)) {
-                    val depthValue = depth[y][x]
-                    if (!depthValue.isNaN() && depthValue.isFinite()) {
-                        sum += depthValue
-                        cnt++
-                    }
-                }
-            }
+    private fun isImageMostlyUniform(bitmap: Bitmap?): Boolean {
+        if (bitmap == null) return false
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        var sum = 0.0
+        val intensities = FloatArray(pixels.size)
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            val intensity = ((pixel shr 16 and 0xFF) * 0.299f) +
+                    ((pixel shr 8 and 0xFF) * 0.587f) +
+                    ((pixel and 0xFF) * 0.114f)
+            intensities[i] = intensity
+            sum += intensity
         }
-        return if (cnt > 0) sum / cnt else Float.MAX_VALUE
-    }
-
-    // Compute avg depth in obstacle mask
-    private fun avgMaskDepth(
-        depth: Array<FloatArray>,
-        mask: Array<FloatArray>
-    ): Float {
-        var sum = 0f
-        var cnt = 0
-        for (y in 0 until depth.size) {
-            for (x in 0 until depth[0].size) {
-                if (mask[y][x] > 0.01f) {
-                    val depthValue = depth[y][x]
-                    if (!depthValue.isNaN() && depthValue.isFinite()) {
-                        sum += depthValue
-                        cnt++
-                    }
-                }
-            }
+        val mean = sum / pixels.size
+        var variance = 0.0
+        for (intensity in intensities) {
+            val diff = intensity - mean
+            variance += diff * diff
         }
-        return if (cnt > 0) sum / cnt else Float.MAX_VALUE
+        variance /= pixels.size
+        val varianceThreshold = 1000f
+        Log.d("ImageUniformity", "Image variance: $variance, threshold: $varianceThreshold")
+        return variance < varianceThreshold
     }
 
     private fun speak(msg: String) {
@@ -923,7 +818,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tts.speak(msg, TextToSpeech.QUEUE_FLUSH, params, "messageId")
     }
 
-    // Extension: ImageProxy → Bitmap for door detection
     private fun ImageProxy.toBitmapFromRGBA(reusableBitmap: Bitmap, canvas: Canvas): Bitmap {
         val buffer = planes[0].buffer
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -954,13 +848,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacks(detectionRunnable)
-        tflite.close()
-        gpuDelegate?.close()
-        segInterpreter.close()
-        segGpuDelegate?.close()
-        depthInterpreter.close()
-        depthGpuDelegate?.close()
+        if (::tflite.isInitialized) {
+            tflite.close()
+        }
+        if (::segInterpreter.isInitialized) {
+            segInterpreter.close()
+        }
+        if (::depthInterpreter.isInitialized) {
+            depthInterpreter.close()
+        }
         cameraExecutor.shutdown()
-        tts.shutdown()
+        if (::tts.isInitialized) {
+            tts.shutdown()
+        }
     }
 }
