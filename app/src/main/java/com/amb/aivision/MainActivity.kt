@@ -29,6 +29,8 @@ import org.opencv.core.MatOfPoint2f
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -65,8 +67,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var canProcess = true
 
     private lateinit var tflite: Interpreter // For YOLO door detection
+    private var gpuDelegate: GpuDelegate? = null
     private lateinit var segInterpreter: Interpreter
+    private var segGpuDelegate: GpuDelegate? = null
     private lateinit var depthInterpreter: Interpreter
+    private var depthGpuDelegate: GpuDelegate? = null
 
     private lateinit var detectionProcessor: ImageProcessor
     private lateinit var imageProcessor: ImageProcessor
@@ -193,11 +198,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun loadModels(): Boolean {
         try {
+            val compatList = CompatibilityList()
+            var useGpu = compatList.isDelegateSupportedOnThisDevice
+
             // Door detection model
-            val options = Interpreter.Options().apply {
-                setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
-                setUseNNAPI(false)
-            }
             val model = try {
                 FileUtil.loadMappedFile(this, "best(2)_float32.tflite")
             } catch (e: Exception) {
@@ -207,7 +211,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 return false
             }
-            tflite = Interpreter(model, options)
+
+            if (useGpu) {
+                try {
+                    val gpuOptions = Interpreter.Options()
+                    gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+                    gpuOptions.addDelegate(gpuDelegate)
+                    tflite = Interpreter(model, gpuOptions)
+                    Log.d(TAG, "Door detection model loaded with GPU delegate")
+                } catch (e: Exception) {
+                    Log.w(TAG, "GPU delegate failed for YOLO model: ${e.message}. Falling back to CPU.", e)
+                    useGpu = false
+                }
+            }
+            if (!useGpu) {
+                val cpuOptions = Interpreter.Options().apply {
+                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
+                    setUseNNAPI(false)
+                }
+                tflite = Interpreter(model, cpuOptions)
+                Log.d(TAG, "Door detection model loaded with CPU")
+            }
             numDetections = tflite.getOutputTensor(0).shape()[2]
 
             // Segmentation model
@@ -220,7 +244,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 return false
             }
-            segInterpreter = Interpreter(segModel, options)
+
+            if (useGpu) {
+                try {
+                    val gpuOptions = Interpreter.Options()
+                    segGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+                    gpuOptions.addDelegate(segGpuDelegate)
+                    segInterpreter = Interpreter(segModel, gpuOptions)
+                    Log.d(TAG, "Segmentation model loaded with GPU delegate")
+                } catch (e: Exception) {
+                    Log.w(TAG, "GPU delegate failed for segmentation model: ${e.message}. Falling back to CPU.", e)
+                    useGpu = false
+                }
+            }
+            if (!useGpu) {
+                val cpuOptions = Interpreter.Options().apply {
+                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
+                    setUseNNAPI(false)
+                }
+                segInterpreter = Interpreter(segModel, cpuOptions)
+                Log.d(TAG, "Segmentation model loaded with CPU")
+            }
 
             // Depth model
             val depthModel = try {
@@ -232,7 +276,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 return false
             }
-            depthInterpreter = Interpreter(depthModel, options)
+
+            if (useGpu) {
+                try {
+                    val gpuOptions = Interpreter.Options()
+                    depthGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+                    gpuOptions.addDelegate(depthGpuDelegate)
+                    depthInterpreter = Interpreter(depthModel, gpuOptions)
+                    Log.d(TAG, "Depth model loaded with GPU delegate")
+                } catch (e: Exception) {
+                    Log.w(TAG, "GPU delegate failed for depth model: ${e.message}. Falling back to CPU.", e)
+                    useGpu = false
+                }
+            }
+            if (!useGpu) {
+                val cpuOptions = Interpreter.Options().apply {
+                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
+                    setUseNNAPI(false)
+                }
+                depthInterpreter = Interpreter(depthModel, cpuOptions)
+                Log.d(TAG, "Depth model loaded with CPU")
+            }
+
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load models: ${e.message}", e)
@@ -851,12 +916,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (::tflite.isInitialized) {
             tflite.close()
         }
+        gpuDelegate?.close()
         if (::segInterpreter.isInitialized) {
             segInterpreter.close()
         }
+        segGpuDelegate?.close()
         if (::depthInterpreter.isInitialized) {
             depthInterpreter.close()
         }
+        depthGpuDelegate?.close()
         cameraExecutor.shutdown()
         if (::tts.isInitialized) {
             tts.shutdown()
