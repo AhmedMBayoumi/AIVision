@@ -562,7 +562,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         inputBuffer.rewind()
         val outputs = Array(1) { Array(5) { FloatArray(8400) } }
         tflite.run(inputBuffer, outputs)
-        val threshold = 0.0f
+        val threshold = 0.6f
         var bestDetection: Pair<RectF, Float>? = null
         var maxConfidence = -1f
 
