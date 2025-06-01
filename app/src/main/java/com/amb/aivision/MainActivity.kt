@@ -2,15 +2,12 @@ package com.amb.aivision
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -39,9 +36,6 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
-import java.io.File
-import java.io.FileOutputStream
-import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -53,20 +47,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
-        private const val STORAGE_PERMISSION_CODE = 1002
         private const val PROCESSING_SIZE = 256           // for both seg & depth
         private const val PROXIMITY_THRESHOLD_M = 2.0f    // 2 meters
         private const val PROXIMITY_THRESHOLD_D = 0.075f
         private const val DETECTION_RESOLUTION = 640      // For door detection
         private const val DEPTH_SCALE_FACTOR = 69.375f    // For MiDaS depth to meters
-        private const val DETECTION_INTERVAL_MS = 3000L   // 3 seconds
+        private const val OBJECT_DETECTION_INTERVAL_MS = 1000L   // 1 second for objects
+        private const val DOOR_DETECTION_INTERVAL_MS = 3000L     // 3 seconds for doors
     }
 
     private lateinit var previewView: PreviewView
     private lateinit var positionTextView: TextView
     private lateinit var detectButton: Button
 
-    private var lastDetectionTime = 0L
+    private var lastObjectDetectionTime = 0L
+    private var lastDoorDetectionTime = 0L
     private var isSpeaking = false
 
     private lateinit var tts: TextToSpeech
@@ -92,7 +87,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         override fun run() {
             if (shouldDetect) {
                 triggerDetection()
-                handler.postDelayed(this, DETECTION_INTERVAL_MS)
+                handler.postDelayed(this, DOOR_DETECTION_INTERVAL_MS)
             }
         }
     }
@@ -373,21 +368,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     @SuppressLint("SetTextI18n")
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
-        if (!shouldDetect || !canProcess) {
+        if (!shouldDetect || !canProcess || isSpeaking) {
             image.close()
             return
         }
-        if (currentTime - lastDetectionTime < DETECTION_INTERVAL_MS || isSpeaking) {
-            Log.d(TAG, "Skipping frame processing - Time since last: ${currentTime - lastDetectionTime}ms, TTS speaking: $isSpeaking")
-            image.close()
-            return
-        }
-        lastDetectionTime = currentTime
+
         canProcess = false
         try {
-            val bmp = image.toBitmap() // Changed from image.toBitmapFromRGBA(reusableBitmap, reusableCanvas)
+            val bmp = image.toBitmap()
             image.close()
-
 
             // Check if the full image is mostly uniform
             if (isImageMostlyUniform(bmp)) {
@@ -398,29 +387,58 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return
             }
 
-            val (doorBox, position) = detectDoor(bmp)
-            if (doorBox == null) {
-                speak("No door detected, please move around")
-                runOnUiThread { positionTextView.text = "No door" }
-                canProcess = true
-                return
+            // Check timing for object and door detection
+            val timeForObjectDetection = currentTime - lastObjectDetectionTime >= OBJECT_DETECTION_INTERVAL_MS
+            val timeForDoorDetection = currentTime - lastDoorDetectionTime >= DOOR_DETECTION_INTERVAL_MS
+
+            if (timeForObjectDetection || timeForDoorDetection) {
+                val fullDepthMap = runDepthEstimation(bmp)
+                val obstacles = runSegmentation(bmp)
+
+                var objectMessage = ""
+                if (timeForObjectDetection) {
+                    val nearbyObstacles = obstacles.filter {
+                        val depth = avgMaskDepthFixed(fullDepthMap, it.mask, bmp.width, bmp.height)
+                        val depthMeters = if (depth.isFinite()) DEPTH_SCALE_FACTOR / depth else Float.MAX_VALUE
+                        depthMeters < PROXIMITY_THRESHOLD_M
+                    }
+                    if (nearbyObstacles.isNotEmpty()) {
+                        objectMessage = "Obstacles detected nearby. Proceed with caution."
+                        Log.d(TAG, "Obstacles detected: ${nearbyObstacles.size}")
+                    }
+                    lastObjectDetectionTime = currentTime
+                }
+
+                var doorMessage = ""
+                if (timeForDoorDetection) {
+                    val (doorBox, position) = detectDoor(bmp)
+                    if (doorBox != null) {
+                        val rawDoorDepth = avgDepthInBoxFixed(fullDepthMap, doorBox, bmp.width, bmp.height)
+                        val doorDepthMeters = if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
+                        Log.d(TAG, "onFrame: Door depth: $doorDepthMeters meters (raw: $rawDoorDepth)")
+                        val blockingObstacles = obstacles.filter { obstacle ->
+                            val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask, bmp.width, bmp.height)
+                            val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
+                            obstacleDepthMeters < doorDepthMeters && obstacleDepthMeters < PROXIMITY_THRESHOLD_M && isObstacleInPath(obstacle.box, doorBox)
+                        }
+                        doorMessage = generateNavigationInstruction(doorBox, bmp.width, bmp.height, blockingObstacles, doorDepthMeters, position)
+                    }
+                    lastDoorDetectionTime = currentTime
+                }
+
+                // Combine messages and speak only if there's a detection
+                val finalMessage = when {
+                    doorMessage.isNotEmpty() && objectMessage.isNotEmpty() -> "$doorMessage $objectMessage"
+                    doorMessage.isNotEmpty() -> doorMessage
+                    objectMessage.isNotEmpty() -> objectMessage
+                    else -> ""
+                }
+
+                if (finalMessage.isNotEmpty()) {
+                    speak(finalMessage)
+                    runOnUiThread { positionTextView.text = finalMessage }
+                }
             }
-            val fullDepthMap = runDepthEstimation(bmp)
-            val rawDoorDepth = avgDepthInBoxFixed(fullDepthMap, doorBox, bmp.width, bmp.height)
-            val doorDepthMeters = if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
-            Log.d(TAG, "onFrame: Door depth: $doorDepthMeters meters (raw: $rawDoorDepth)")
-            val obstacles = runSegmentation(bmp)
-            val blockingObstacles = obstacles.filter { obstacle ->
-                val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask, bmp.width, bmp.height)
-                val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
-                Log.d(TAG, "onFrame: Obstacle depth calculated: $obstacleDepthMeters meters (raw: $obstacleDepth)")
-                obstacleDepthMeters < doorDepthMeters &&
-                        obstacleDepthMeters < PROXIMITY_THRESHOLD_M &&
-                        isObstacleInPath(obstacle.box, doorBox)
-            }
-            val msg = generateNavigationInstruction(doorBox, bmp.width, bmp.height, blockingObstacles, doorDepthMeters, position)
-            speak(msg)
-            runOnUiThread { positionTextView.text = msg }
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
             runOnUiThread { positionTextView.text = "Error: ${e.message}" }
@@ -578,7 +596,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tflite.run(inputBuffer, outputs)
         val threshold = 0.6f
         var bestDetection: Pair<RectF, Float>? = null
+        var secondBestDetection: Pair<RectF, Float>? = null
         var maxConfidence = -1f
+        var secondMaxConfidence = -1f
+        var position: String = ""
+        var secondPosition: String = ""
 
         // Log all detections above threshold
         Log.d(TAG, "YOLO Model Output: Printing detections with confidence > $threshold")
@@ -601,14 +623,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         }
 
-        // Select the best detection
+        // Select the best and second-best detections and determine positions
         for (i in 0 until 8400) {
             val x = outputs[0][0][i]
             val y = outputs[0][1][i]
             val w = outputs[0][2][i]
             val h = outputs[0][3][i]
             val confidence = outputs[0][4][i]
-            if (confidence > threshold && confidence > maxConfidence) {
+            if (confidence > threshold) {
                 val centerX = x * bitmap.width
                 val centerY = y * bitmap.height
                 val widthScaled = w * bitmap.width
@@ -618,30 +640,66 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 val right = centerX + widthScaled / 2
                 val bottom = centerY + heightScaled / 2
                 val rect = RectF(left, top, right, bottom)
-                bestDetection = Pair(rect, confidence)
-                maxConfidence = confidence
+
+                if (confidence > maxConfidence) {
+                    // Shift current best to second best
+                    secondBestDetection = bestDetection
+                    if (secondBestDetection != null) {
+                        val secondCenterX = (secondBestDetection.first.left + secondBestDetection.first.right) / 2
+                        val secondNormalizedX = secondCenterX / bitmap.width
+                        secondPosition = when {
+                            secondNormalizedX < 0.33 -> "left"
+                            secondNormalizedX < 0.66 -> "mid"
+                            else -> "right"
+                        }
+                    }
+                    bestDetection = Pair(rect, confidence)
+                    maxConfidence = confidence
+                    val centerXPos = (rect.left + rect.right) / 2
+                    val normalizedX = centerXPos / bitmap.width
+                    position = when {
+                        normalizedX < 0.33 -> "left"
+                        normalizedX < 0.66 -> "mid"
+                        else -> "right"
+                    }
+                    Log.d(TAG, "New best detection at position: $position, confidence: $confidence, box: $rect")
+                } else if (confidence > secondMaxConfidence && confidence != maxConfidence) {
+                    secondBestDetection = Pair(rect, confidence)
+                    secondMaxConfidence = confidence
+                    val centerXPos = (rect.left + rect.right) / 2
+                    val normalizedX = centerXPos / bitmap.width
+                    secondPosition = when {
+                        normalizedX < 0.33 -> "left"
+                        normalizedX < 0.66 -> "mid"
+                        else -> "right"
+                    }
+                    Log.d(TAG, "New second-best detection at position: $secondPosition, confidence: $confidence, box: $rect")
+                }
             }
         }
+
         if (bestDetection != null) {
             val rect = bestDetection.first
             val croppedBitmap = cropBitmap(bitmap, rect)
-            if (confirmDoorWithClassicalMethods(croppedBitmap)) {
-                val centerX = (rect.left + rect.right) / 2
-                val normalizedX = centerX / bitmap.width
-                val position = when {
-                    normalizedX < 0.33 -> "left"
-                    normalizedX < 0.66 -> "mid"
-                    else -> "right"
-                }
-                Log.d(TAG, "Door confirmed at position: $position, confidence: ${bestDetection.second}, box: $rect")
+            val isDoorConfirmed = confirmDoorWithClassicalMethods(croppedBitmap)
+            if (isDoorConfirmed) {
+                // Classical methods agree, use the best detection's position
+                Log.d(TAG, "Classical methods confirmed door at position: $position, confidence: ${bestDetection.second}, box: $rect")
                 return Pair(rect, position)
+            } else if (secondBestDetection != null) {
+                // Classical methods disagree, use the second-best detection's position
+                Log.d(TAG, "Classical methods did not confirm best door, falling back to second-best detection at position: $secondPosition, confidence: ${secondBestDetection.second}, box: ${secondBestDetection.first}")
+                return Pair(secondBestDetection.first, secondPosition)
             } else {
-                Log.d(TAG, "Detected object is not a door")
+                // No second-best detection, fall back to best detection's position
+                Log.d(TAG, "Classical methods did not confirm door, no second-best detection, using best detection at position: $position")
+                return Pair(rect, position)
             }
         }
         Log.d(TAG, "No door detected")
         return Pair(null, "")
     }
+
 
     private fun cropBitmap(bitmap: Bitmap, rect: RectF): Bitmap {
         val left = rect.left.toInt().coerceIn(0, bitmap.width)
@@ -896,8 +954,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "messageId")
         tts.speak(msg, TextToSpeech.QUEUE_FLUSH, params, "messageId")
     }
-
-
 
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
