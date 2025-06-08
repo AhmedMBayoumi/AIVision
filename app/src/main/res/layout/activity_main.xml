@@ -14,7 +14,6 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-
     <TextView
         android:id="@+id/positionTextView"
         android:layout_width="wrap_content"
@@ -38,5 +37,48 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Circular Icon Buttons on the right side -->
+    <ImageButton
+        android:id="@+id/chairButton"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/circular_button_background"
+        android:src="@drawable/ic_chair"
+        android:scaleType="centerInside"
+        android:contentDescription="Chair detection"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/carButton"
+        app:layout_constraintVertical_chainStyle="packed" />
+
+    <ImageButton
+        android:id="@+id/carButton"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/circular_button_background"
+        android:src="@drawable/ic_car"
+        android:scaleType="centerInside"
+        android:contentDescription="Car detection"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/chairButton"
+        app:layout_constraintBottom_toTopOf="@id/doorButton" />
+
+    <ImageButton
+        android:id="@+id/doorButton"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/circular_button_background"
+        android:src="@drawable/ic_door"
+        android:scaleType="centerInside"
+        android:contentDescription="Door detection"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/carButton"
+        app:layout_constraintBottom_toBottomOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
