@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.*
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -18,14 +19,21 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import android.util.Size
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
@@ -50,9 +58,11 @@ import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.*
+import androidx.core.graphics.createBitmap
 
 private const val TAG = "DoorDetection"
 
+@SuppressLint("SetTextI18n")
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     companion object {
@@ -61,7 +71,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val PROXIMITY_THRESHOLD_D = 0.075f // Close to door
         private const val DETECTION_RESOLUTION = 640   // For door detection
         private const val DEPTH_SCALE_FACTOR = 100.0f   // For MiDaS depth to meters
-        private const val DETECTION_INTERVAL_MS = 500L // 0.5 second for both
+        private const val DETECTION_INTERVAL_MS = 400L // 0.4 second for both
     }
 
     private val classNames = listOf(
@@ -80,27 +90,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     )
 
     private lateinit var previewView: PreviewView
-    private lateinit var positionTextView: TextView
+    lateinit var positionTextView: TextView
     private lateinit var detectButton: Button
     private lateinit var speechRecognizer: SpeechRecognizer
 
     private var lastDetectionTime = 0L
     private var isSpeaking = false
-    private var isVoiceActive = false // Tracks if voice mode is active
-    private var isRecognizerListening = false // Tracks if SpeechRecognizer is active
-    private var previousMessage: String? = null // Track previous TTS message
-    private var consecutiveIdenticalCount = 0  // Count consecutive identical messages
+    private var isVoiceActive = false
+    private var isRecognizerListening = false
+    private var previousMessage: String? = null
+    private var consecutiveIdenticalCount = 0
 
     private lateinit var tts: TextToSpeech
     private var shouldDetectDoors = false
     private var shouldDetectCars = false
     private var shouldDetectChairs = false
     private var shouldDetect = shouldDetectDoors || shouldDetectCars || shouldDetectChairs
+    private var isDeepSceneDiscoveryActive = false
 
     private var canProcess = true
-    private var useYolo12s = false // Track current door detection model
+    private var useYolo12s = false
+    private var isFirstLaunch = true
 
-    private lateinit var tflite: Interpreter // For YOLO door detection
+    private lateinit var tflite: Interpreter
     private var gpuDelegate: GpuDelegate? = null
     private lateinit var segInterpreter: Interpreter
     private var segGpuDelegate: GpuDelegate? = null
@@ -114,15 +126,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var cameraExecutor: ExecutorService
     private var initialOfflineWarningSent = false
     private var hasGreeted = false
-    private var hasSpokenOfflineWarning = false // New flag
-    private var hasSpokenDoorWarning = false // New flag
-    private var cameraProvider: ProcessCameraProvider? = null // Store for unbinding
-    private var wasDetectingBeforePause = false // Track detection state
+    private var hasSpokenOfflineWarning = false
+    private var hasSpokenDoorWarning = false
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var wasDetectingBeforePause = false
     private lateinit var chairButton: ImageButton
     private lateinit var carButton: ImageButton
     private lateinit var doorButton: ImageButton
 
-    // Handler for periodic detection
+    private lateinit var deepSceneDiscovery: DeepSceneDiscovery
+
     private val handler = Handler(Looper.getMainLooper())
     private val detectionRunnable = object : Runnable {
         override fun run() {
@@ -133,44 +146,34 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private var preview: Preview? = null
+    private var analysis: ImageAnalysis? = null
+
     @SuppressLint("MissingPermission")
     private fun isInternetAvailable(): Boolean {
         val connectivityManager =
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val network = connectivityManager.activeNetwork ?: return false
-            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-        } else {
-            @Suppress("DEPRECATION")
-            val networkInfo = connectivityManager.activeNetworkInfo ?: return false
-            return networkInfo.isConnected
-        }
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
-
-    // Reusable objects for door detection
-    private val reusableBitmap by lazy {
-        Bitmap.createBitmap(DETECTION_RESOLUTION, DETECTION_RESOLUTION, Bitmap.Config.ARGB_8888)
-    }
-    private val reusableCanvas by lazy { Canvas(reusableBitmap) }
 
     private var numDetections: Int = 0
-    private val attributes: Int = 5 // Matches the output shape [1, 5, 8400]
     private var isWaitingForIconSelection = false
 
-    @SuppressLint("SetTextI18n")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (OpenCVLoader.initLocal()) {
-            Log.d("OpenCV", "OpenCV loaded successfully")
+            Log.d(TAG, "OpenCV loaded successfully")
         } else {
-            Log.e("OpenCV", "Failed to load OpenCV")
+            Log.e(TAG, "Failed to load OpenCV")
         }
         setContentView(R.layout.activity_main)
 
-        // Initialize UI components
         previewView = findViewById(R.id.previewView)
+        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         positionTextView = findViewById(R.id.positionTextView)
         detectButton = findViewById(R.id.detectButton)
         chairButton = findViewById(R.id.chairButton)
@@ -182,24 +185,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         doorButton.visibility = View.GONE
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+        deepSceneDiscovery = DeepSceneDiscovery(this)
 
-        // Set click listeners
-        doorButton.setOnClickListener {
-            startDetection("door")
-        }
-        chairButton.setOnClickListener {
-            startDetection("chair")
-        }
-        carButton.setOnClickListener {
-            startDetection("car")
-        }
+        doorButton.setOnClickListener { startDetection("door") }
+        chairButton.setOnClickListener { startDetection("chair") }
+        carButton.setOnClickListener { startDetection("car") }
         detectButton.setOnClickListener { toggleDetection() }
         detectButton.setOnLongClickListener {
             toggleDoorModel()
             true
         }
 
-        // Request permissions and initialize if granted
         val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -218,8 +214,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Update initializeComponents to respect wasDetectingBeforePause
-    @SuppressLint("SetTextI18n")
     private fun initializeComponents() {
         Log.d(TAG, "Initializing components")
         setupFullscreenUI()
@@ -230,17 +224,94 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
 
-        // Initialize TTS
         if (::tts.isInitialized) {
             tts.shutdown()
         }
         tts = TextToSpeech(this, this)
 
-        // Initialize SpeechRecognizer
+        initSpeechRecognizer()
+        Log.d(TAG, "SpeechRecognizer initialized in initializeComponents")
+
+        if (!isInternetAvailable()) {
+            Log.w(TAG, "No internet connection available")
+            initialOfflineWarningSent = true
+        }
+        startCamera()
+        // Delay startVoiceRecognition to ensure SpeechRecognizer is ready
+        handler.postDelayed({
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startVoiceRecognition()
+            }
+        }, 100L)
+
+        if (wasDetectingBeforePause && !shouldDetect) {
+            shouldDetect = true
+            shouldDetectDoors = true
+            detectButton.text = "Stop detecting"
+            handler.post(detectionRunnable)
+        }
+    }
+
+    private fun startVoiceRecognition() {
+        if (isRecognizerListening || isSpeaking || ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.d(TAG, "startVoiceRecognition skipped: isRecognizerListening=$isRecognizerListening, isSpeaking=$isSpeaking, permissionGranted=${ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED}")
+            return
+        }
+
+        if (!isInternetAvailable()) {
+            Log.w(TAG, "No internet connection for voice recognition")
+            runOnUiThread {
+                detectButton.visibility = View.VISIBLE
+                detectButton.isEnabled = true
+            }
+            if (!hasSpokenOfflineWarning) {
+                speak("No internet connection. Voice recognition unavailable.")
+                hasSpokenOfflineWarning = true
+            }
+            handler.postDelayed({ startVoiceRecognition() }, 5000L)
+            return
+        }
+
+        hasSpokenOfflineWarning = false
+        runOnUiThread {
+            detectButton.visibility = View.GONE
+            detectButton.isEnabled = true
+            if (!hasSpokenDoorWarning) {
+                positionTextView.text = "Listening for commands..."
+            }
+        }
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Log.e(TAG, "Speech recognition not available on this device")
+            runOnUiThread { positionTextView.text = "Speech recognition not supported on this device" }
+            handler.postDelayed({ startVoiceRecognition() }, 1000L)
+            return
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 10000L) // 10 seconds
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true) // Optional: for smoother feedback
+        }
+        try {
+            Log.d(TAG, "Starting voice recognition with intent: $intent")
+            speechRecognizer.startListening(intent)
+            isRecognizerListening = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start voice recognition: ${e.message}", e)
+            isRecognizerListening = false
+            handler.postDelayed({ startVoiceRecognition() }, 100L)
+        }
+    }
+
+    private fun initSpeechRecognizer() {
         if (::speechRecognizer.isInitialized) {
+            Log.d(TAG, "Destroying existing SpeechRecognizer")
             speechRecognizer.destroy()
         }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        Log.d(TAG, "Created new SpeechRecognizer: $speechRecognizer")
         speechRecognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 isRecognizerListening = true
@@ -248,158 +319,165 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             override fun onBeginningOfSpeech() {
-                Log.d(TAG, "SpeechRecognizer began listening")
+                Log.d(TAG, "SpeechRecognizer detected beginning of speech")
             }
 
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
+
             override fun onEndOfSpeech() {
                 isRecognizerListening = false
-                Log.d(TAG, "SpeechRecognizer ended speech input")
+                Log.d(TAG, "SpeechRecognizer detected end of speech")
+                // Restart immediately to minimize pause
+                if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
+                    startVoiceRecognition()
+                }
             }
 
             override fun onError(error: Int) {
                 isRecognizerListening = false
-                Log.e(TAG, "Speech recognition error: $error")
-                if (!isSpeaking && (isVoiceActive || !shouldDetectDoors)) {
-                    handler.postDelayed({ startVoiceRecognition() }, 100L)
+                Log.e(TAG, "SpeechRecognizer error: $error")
+                // Only restart for critical errors
+                when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                        // Ignore transient errors (no speech or timeout)
+                        if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
+                            startVoiceRecognition() // Immediate restart
+                        }
+                    }
+                    else -> {
+                        // For other errors, use a delay to avoid rapid retries
+                        if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
+                            handler.postDelayed({ startVoiceRecognition() }, 100L)
+                        }
+                    }
                 }
             }
 
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (matches != null && matches.isNotEmpty()) {
+                Log.d(TAG, "SpeechRecognizer results: $matches")
+                if (!matches.isNullOrEmpty()) {
                     val spokenText = matches[0]
-                    Log.d(TAG, "Recognized: '$spokenText', isVoiceActive=$isVoiceActive, shouldDetect=$shouldDetectDoors")
-                    if (!isSpeaking) { // Process only if not speaking
+                    if (!isSpeaking) {
                         processVoiceCommand(spokenText)
                     }
-                    if (!isSpeaking && (isVoiceActive || !shouldDetectDoors)) {
-                        handler.postDelayed({ startVoiceRecognition() }, 100L)
-                    }
-                } else if (!isSpeaking && (isVoiceActive || !shouldDetectDoors)) {
-                    handler.postDelayed({ startVoiceRecognition() }, 100L)
+                }
+                // Only restart if still in listening mode
+                if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
+                    startVoiceRecognition() // Immediate restart
                 }
             }
 
-            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onPartialResults(partialResults: Bundle?) {
+                Log.d(TAG, "Partial results: ${partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)}")
+            }
+
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
-
-        detectButton.setOnClickListener { toggleDetection() }
-        detectButton.setOnLongClickListener {
-            toggleDoorModel()
-            true
-        }
-
-        // Start camera and voice recognition
-        if (!isInternetAvailable()) {
-            Log.w(TAG, "No internet connection available")
-            initialOfflineWarningSent = true
-        }
-        startCamera()
-        startVoiceRecognition()
-
-        // Restore detection only if explicitly active before pause
-        if (wasDetectingBeforePause && !shouldDetect) {
-            shouldDetect = true
-            shouldDetectDoors = true // Default to doors
-            detectButton.text = "Stop detecting"
-            handler.post(detectionRunnable)
-            Log.d(TAG, "Restored continuous detection")
-        }
     }
 
-
-    override fun onPause() {
-        super.onPause()
-        // Stop detection and speech recognition when app goes to background
-        shouldDetect = false
-        shouldDetectDoors = false
-        shouldDetectCars = false
-        shouldDetectChairs = false
-        isVoiceActive = false
-        hasGreeted = false
-        handler.removeCallbacks(detectionRunnable)
-        detectButton.text = "Detect"
-        runOnUiThread { positionTextView.text = "Detection stopped" }
-        Log.d(TAG, "App paused: Stopped detection and reset voice state")
-
-        if (::speechRecognizer.isInitialized && isRecognizerListening) {
-            speechRecognizer.stopListening()
-            isRecognizerListening = false
-            Log.d(TAG, "Stopped SpeechRecognizer on pause")
+    override fun onResume() {
+        super.onResume()
+        // Always re-initialize the recognizer on resume
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            initSpeechRecognizer()
         }
 
-        // Stop TTS if speaking
-        if (::tts.isInitialized && isSpeaking) {
-            tts.stop()
-            isSpeaking = false
-            Log.d(TAG, "Stopped TTS on pause")
+        if (isFirstLaunch) {
+            // On the very first launch, set the initial state
+            isFirstLaunch = false
+            shouldDetect = false
+            shouldDetectDoors = false
+            shouldDetectCars = false
+            shouldDetectChairs = false
+            isDeepSceneDiscoveryActive = false
+            detectButton.text = "Detect"
+            runOnUiThread { positionTextView.text = "Waiting for voice commands..." }
+            handler.postDelayed({ startVoiceRecognition() }, 100L) // Start listening
+        } else {
+            // On subsequent resumes, decide what to do
+            if (wasDetectingBeforePause) {
+                // If we were in any detection mode, call BOTH stop functions to ensure a clean reset.
+                stopDetection()
+                stopDeepSceneDiscovery()
+                wasDetectingBeforePause = false // Reset the flag for the next pause event
+            } else {
+                // Otherwise, just start listening for commands
+                handler.postDelayed({ startVoiceRecognition() }, 100L)
+            }
         }
     }
 
     override fun onStop() {
         super.onStop()
-        Log.d(TAG, "Stopping activity")
-
-        // Additional cleanup if needed (most handled in onPause)
         if (::speechRecognizer.isInitialized) {
+            Log.d(TAG, "Destroying SpeechRecognizer in onStop")
             speechRecognizer.destroy()
-            Log.d(TAG, "SpeechRecognizer destroyed during stop")
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        // Restart speech recognition to listen for new commands
-        if (::speechRecognizer.isInitialized && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            startVoiceRecognition()
-            Log.d(TAG, "App resumed: Started SpeechRecognizer")
-        }
-        // Ensure detection remains off until commanded
+    override fun onPause() {
+        super.onPause()
+        // Keep track of the detection state
+        wasDetectingBeforePause = shouldDetect || isDeepSceneDiscoveryActive
+
+        // Stop active processes but DON'T reset the logical state
         shouldDetect = false
-        shouldDetectDoors = false
-        shouldDetectCars = false
-        shouldDetectChairs = false
-        detectButton.text = "Detect"
-        runOnUiThread { positionTextView.text = "Waiting for voice commands..." }
-        Log.d(TAG, "App resumed: Waiting for voice commands")
+        handler.removeCallbacks(detectionRunnable)
+
+        if (::speechRecognizer.isInitialized && isRecognizerListening) {
+            speechRecognizer.stopListening()
+            isRecognizerListening = false
+        }
+
+        if (::tts.isInitialized && isSpeaking) {
+            tts.stop()
+            isSpeaking = false
+        }
     }
+
+
+
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts.language = Locale.US
-            tts.setSpeechRate(1.25f) // Increase speech rate by 25%
+            tts.setSpeechRate(1.25f)
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     isSpeaking = true
-                    Log.d(TAG, "TTS started speaking")
                     if (isRecognizerListening) {
                         speechRecognizer.stopListening()
                         isRecognizerListening = false
-                        Log.d(TAG, "Stopped SpeechRecognizer during TTS")
                     }
                 }
                 override fun onDone(utteranceId: String?) {
                     isSpeaking = false
-                    Log.d(TAG, "TTS finished speaking")
-                    if ((isVoiceActive || !shouldDetectDoors) && !isRecognizerListening) {
+
+                    if (isDeepSceneDiscoveryActive) {
+                        deepSceneDiscovery.onSpeechFinished()
+                    }
+
+                    if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) {
                         startVoiceRecognition()
-                        Log.d(TAG, "Restarted SpeechRecognizer after TTS")
                     }
                 }
+                @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     isSpeaking = false
-                    Log.e(TAG, "TTS error occurred")
-                    if ((isVoiceActive || !shouldDetectDoors) && !isRecognizerListening) {
+
+                    if (isDeepSceneDiscoveryActive) {
+                        deepSceneDiscovery.onSpeechFinished()
+                    }
+
+                    if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) {
                         startVoiceRecognition()
-                        Log.d(TAG, "Restarted SpeechRecognizer after TTS error")
                     }
                 }
             })
             if (initialOfflineWarningSent && !isInternetAvailable()) {
-                speak("No internet connection. Some features like voice recognition may not work.")
+                speak("No internet connection. Some features may not work.")
             }
         } else {
             Log.e(TAG, "TTS initialization failed")
@@ -407,75 +485,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun startVoiceRecognition() {
-        if (isRecognizerListening) {
-            Log.d(TAG, "SpeechRecognizer already listening, skipping start")
-            return
-        }
-        if (isSpeaking) {
-            Log.d(TAG, "TTS is speaking, skipping SpeechRecognizer start")
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "RECORD_AUDIO permission not granted, cannot start voice recognition")
-            runOnUiThread { positionTextView.text = "Audio permission required for voice recognition" }
-            return
-        }
-        if (!isInternetAvailable()) {
-            Log.w(TAG, "No internet connection, cannot start voice recognition")
-            runOnUiThread {
-                detectButton.visibility = View.VISIBLE
-            }
-            if (!hasSpokenOfflineWarning) {
-                speak("No internet connection. Voice recognition is unavailable. Use the button to detect.")
-                hasSpokenOfflineWarning = true
-            }
-            handler.postDelayed({ startVoiceRecognition() }, 5000L)
-            return
-        }
-        // Internet is available, reset offline warning flag
-        hasSpokenOfflineWarning = false
-        runOnUiThread {
-            detectButton.visibility = View.GONE
-            // Only update text if SpeechRecognizer is about to start and TTS is not speaking
-            if (!hasSpokenDoorWarning) {
-                positionTextView.text = "Listening for commands..."
-            }
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            Log.e(TAG, "Speech recognition is not available on this device")
-            runOnUiThread { positionTextView.text = "Speech recognition not available on this device" }
-            handler.postDelayed({ startVoiceRecognition() }, 1000L)
-            return
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Say 'hello', 'start', 'doors', 'cars', 'chairs', or 'stop'")
-        }
-        try {
-            speechRecognizer.startListening(intent)
-            isRecognizerListening = true
-            Log.d(TAG, "Started voice recognition")
-        } catch (e: Exception) {
-            isRecognizerListening = false
-            Log.e(TAG, "Failed to start speech recognition: ${e.message}")
-            handler.postDelayed({ startVoiceRecognition() }, 1000L)
-        }
-    }
 
     private fun processVoiceCommand(command: String) {
-        Log.d(TAG, "Processing command: '$command', isVoiceActive=$isVoiceActive, shouldDetect=$shouldDetectDoors")
         if (command.isBlank() || command.lowercase(Locale.getDefault()) in listOf(
                 "hello, how can i help you", "starting detection, press on the icon that you want to detect",
                 "starting detecting doors", "starting detecting cars", "starting detecting chairs", "stopping detection",
                 "no internet connection. voice recognition is unavailable. use the button to detect",
-                "no internet connection. some features like voice recognition may not work")) {
-            Log.d(TAG, "Ignored command: '$command' (empty or TTS feedback)")
+                "no internet connection. some features like voice recognition may not work",
+                "starting deep scene discovery", "stopping deep scene discovery")) {
             return
         }
         if (isSpeaking) {
-            Log.d(TAG, "Ignored command: '$command' (TTS active, no recognition allowed)")
             return
         }
         when {
@@ -485,39 +505,33 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     speak("Hello, how can I help you?")
                     hasGreeted = true
                 }
-                runOnUiThread { positionTextView.text = "Voice activated, say 'doors', 'cars', 'chairs', or 'stop'" }
-                Log.d(TAG, "Voice command: Activated with 'hello' or 'VAI'")
+                runOnUiThread { positionTextView.text = "Voice activated, say 'doors', 'cars', 'chairs', 'deep scene discovery', or 'stop'" }
             }
-            command.lowercase(Locale.getDefault()).contains("doors") -> {
+            command.lowercase(Locale.getDefault()).contains("doors") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectDoors) {
                     startDetection("door")
-                    Log.d(TAG, "Voice command: Started door detection")
-                } else {
-                    Log.d(TAG, "Voice command: Ignored 'doors' as detection is already active")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("cars") -> {
+            command.lowercase(Locale.getDefault()).contains("cars") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectCars) {
                     startDetection("car")
-                    Log.d(TAG, "Voice command: Started car detection")
-                } else {
-                    Log.d(TAG, "Voice command: Ignored 'cars' as detection is already active")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("chairs") -> {
+            command.lowercase(Locale.getDefault()).contains("chairs") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectChairs) {
                     startDetection("chair")
-                    Log.d(TAG, "Voice command: Started chair detection")
-                } else {
-                    Log.d(TAG, "Voice command: Ignored 'chairs' as detection is already active")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("stop") -> {
-                stopDetection()
-                Log.d(TAG, "Voice command: Stopped detection")
+            command.lowercase(Locale.getDefault()).contains("deep") || command.lowercase(Locale.getDefault()).contains("scene") || command.lowercase(Locale.getDefault()).contains("discovery") -> {
+                if (!isDeepSceneDiscoveryActive) {
+                    startDeepSceneDiscovery()
+                }
             }
-            else -> {
-                Log.d(TAG, "Voice command: Unrecognized command: '$command'")
+            command.lowercase(Locale.getDefault()).contains("stop") && isDeepSceneDiscoveryActive -> {
+                stopDeepSceneDiscovery()
+            }
+            command.lowercase(Locale.getDefault()).contains("stop") && !isDeepSceneDiscoveryActive -> {
+                stopDetection()
             }
         }
     }
@@ -563,14 +577,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             .build()
     }
 
-    @SuppressLint("SetTextI18n")
     private fun loadModels(): Boolean {
         try {
             val compatList = CompatibilityList()
             var useGpu = compatList.isDelegateSupportedOnThisDevice
 
-            // Load door detection model based on useYolo12s
-            val modelFile = if (useYolo12s) "yolo12s.tflite" else "best(2)_float32.tflite"
+            val modelFile = if (useYolo12s) "yolo12s.tflite" else "yolo8n.tflite"
             val model = try {
                 FileUtil.loadMappedFile(this, modelFile)
             } catch (e: Exception) {
@@ -581,7 +593,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return false
             }
 
-            // Close existing tflite and gpuDelegate
             if (::tflite.isInitialized) {
                 tflite.close()
             }
@@ -593,27 +604,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(gpuDelegate)
                     tflite = Interpreter(model, gpuOptions)
-                    Log.d(TAG, "Door detection model $modelFile loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(
-                        TAG,
-                        "GPU delegate failed for YOLO model: ${e.message}. Falling back to CPU.",
-                        e
-                    )
+                    Log.w(TAG, "GPU delegate failed for YOLO: ${e.message}. Falling back to CPU.", e)
                     useGpu = false
                 }
             }
             if (!useGpu) {
                 val cpuOptions = Interpreter.Options().apply {
-                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
-                    setUseNNAPI(false)
+                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                    useNNAPI = false
                 }
                 tflite = Interpreter(model, cpuOptions)
-                Log.d(TAG, "Door detection model $modelFile loaded with CPU")
             }
             numDetections = tflite.getOutputTensor(0).shape()[2]
 
-            // Load segmentation model
             val segModel = try {
                 FileUtil.loadMappedFile(this, "yolo11s-seg.tflite")
             } catch (e: Exception) {
@@ -630,26 +634,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     segGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(segGpuDelegate)
                     segInterpreter = Interpreter(segModel, gpuOptions)
-                    Log.d(TAG, "Segmentation model loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(
-                        TAG,
-                        "GPU delegate failed for segmentation model: ${e.message}. Falling back to CPU.",
-                        e
-                    )
+                    Log.w(TAG, "GPU delegate failed for seg: ${e.message}. Falling back to CPU.", e)
                     useGpu = false
                 }
             }
             if (!useGpu) {
                 val cpuOptions = Interpreter.Options().apply {
-                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
-                    setUseNNAPI(false)
+                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                    useNNAPI = false
                 }
                 segInterpreter = Interpreter(segModel, cpuOptions)
-                Log.d(TAG, "Segmentation model loaded with CPU")
             }
 
-            // Load depth model
             val depthModel = try {
                 FileUtil.loadMappedFile(this, "MiDas.tflite")
             } catch (e: Exception) {
@@ -666,87 +663,168 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     depthGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(depthGpuDelegate)
                     depthInterpreter = Interpreter(depthModel, gpuOptions)
-                    Log.d(TAG, "Depth model loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(
-                        TAG,
-                        "GPU delegate failed for depth model: ${e.message}. Falling back to CPU.",
-                        e
-                    )
+                    Log.w(TAG, "GPU delegate failed for depth: ${e.message}. Falling back to CPU.", e)
                     useGpu = false
                 }
             }
             if (!useGpu) {
                 val cpuOptions = Interpreter.Options().apply {
-                    setNumThreads(min(Runtime.getRuntime().availableProcessors(), 4))
-                    setUseNNAPI(false)
+                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                    useNNAPI = false
                 }
                 depthInterpreter = Interpreter(depthModel, cpuOptions)
-                Log.d(TAG, "Depth model loaded with CPU")
             }
 
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load models: ${e.message}", e)
-            runOnUiThread {
-                positionTextView.text = "Error loading models: ${e.message}"
-            }
+            runOnUiThread { positionTextView.text = "Error loading models: ${e.message}" }
             return false
         }
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            this.cameraProvider = cameraProvider
 
-            val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(android.util.Size(640, 640))
+            val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display?.rotation ?: Surface.ROTATION_0
+            } else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay.rotation
+            }
+
+            preview = Preview.Builder()
+                .setTargetRotation(rotation)
+                .build()
+                .also { it.surfaceProvider = previewView.surfaceProvider }
+
+            analysis = ImageAnalysis.Builder()
+                .setTargetRotation(rotation)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(640, 640),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                )
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, { proxy -> onFrame(proxy) })
-                }
+                .also { it.setAnalyzer(cameraExecutor) { proxy -> onFrame(proxy) } }
 
             try {
+                val cameraInfos = cameraProvider.availableCameraInfos
+                if (cameraInfos.isEmpty()) {
+                    Log.w(TAG, "No cameras available, using default back camera")
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        this,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis
+                    )
+                    return@addListener
+                }
+
+                val rearCameras = cameraInfos.filter { cameraInfo ->
+                    val lensFacing = cameraInfo.lensFacing
+                    lensFacing == CameraSelector.LENS_FACING_BACK
+                }
+
+                if (rearCameras.isEmpty()) {
+                    Log.w(TAG, "No rear-facing cameras found, using default back camera")
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        this,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis
+                    )
+                    return@addListener
+                }
+
+                var selectedCameraInfo = rearCameras[0]
+                var shortestFocalLength = Float.MAX_VALUE
+
+                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                for (cameraInfo in rearCameras) {
+                    val camera2Info = Camera2CameraInfo.from(cameraInfo)
+                    val cameraId = camera2Info.cameraId
+                    val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+                    val focalLengths = characteristics.get(android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    if (focalLengths != null && focalLengths.isNotEmpty()) {
+                        val minFocalLength = focalLengths.minOrNull() ?: Float.MAX_VALUE
+                        if (minFocalLength < shortestFocalLength) {
+                            shortestFocalLength = minFocalLength
+                            selectedCameraInfo = cameraInfo
+                        }
+                    }
+                }
+
+                val cameraSelector = if (shortestFocalLength < Float.MAX_VALUE) {
+                    Log.d(TAG, "Selected camera with widest FOV (focal length: $shortestFocalLength mm)")
+                    CameraSelector.Builder()
+                        .addCameraFilter { list -> list.filter { it == selectedCameraInfo } }
+                        .build()
+                } else {
+                    Log.w(TAG, "No focal length data available, using default back camera")
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
+
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(
                     this,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    cameraSelector,
                     preview,
                     analysis
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Camera binding failed: ${e.message}", e)
+                runOnUiThread { positionTextView.text = "Camera binding failed: ${e.message}" }
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Update toggleDetection to synchronize shouldDetect
-    // Edited function: Toggles between prompting for icon selection and stopping
-    @SuppressLint("SetTextI18n")
-    private fun toggleDetection() {
-        if (shouldDetect || isWaitingForIconSelection) {
-            stopDetection()
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation ?: Surface.ROTATION_0
         } else {
-            startDetection() // Prompt for icon selection
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+        preview?.targetRotation = rotation
+        analysis?.targetRotation = rotation
+    }
+
+    private fun toggleDetection() {
+        if (shouldDetect || isWaitingForIconSelection || isDeepSceneDiscoveryActive) {
+            if (isDeepSceneDiscoveryActive) {
+                stopDeepSceneDiscovery()
+            } else {
+                stopDetection()
+            }
+        } else {
+            startDetection()
         }
     }
 
-    @SuppressLint("SetTextI18n")
     private fun toggleDoorModel() {
         useYolo12s = !useYolo12s
-        val modelName = if (useYolo12s) "yolo12s" else "best(2)_float32"
+        val modelName = if (useYolo12s) "yolo12s" else "yolo8n"
         if (loadModels()) {
             Toast.makeText(this, "Changed model to $modelName", Toast.LENGTH_SHORT).show()
-            Log.d(TAG, "Switched door detection model to $modelName")
         } else {
             Toast.makeText(this, "Failed to change model to $modelName", Toast.LENGTH_SHORT).show()
-            useYolo12s = !useYolo12s // Revert on failure
-            Log.e(TAG, "Failed to switch to $modelName")
+            useYolo12s = !useYolo12s
         }
     }
 
@@ -756,22 +834,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    @SuppressLint("SetTextI18n")
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
-        if (!shouldDetect || !canProcess || currentTime - lastDetectionTime < DETECTION_INTERVAL_MS) {
+        if ((!shouldDetect && !isDeepSceneDiscoveryActive) || !canProcess || currentTime - lastDetectionTime < DETECTION_INTERVAL_MS) {
             image.close()
-            Log.d(TAG, "Skipped frame: shouldDetect=$shouldDetect, canProcess=$canProcess, timeSinceLast=$currentTime - $lastDetectionTime")
             return
         }
 
         canProcess = false
         lastDetectionTime = currentTime
         try {
-            val bmp = image.toBitmap()
+            val bmp = imageProxyToBitmap(image)
             image.close()
 
-            // Check if the full image is mostly uniform (e.g., too close to a wall)
+            if (isDeepSceneDiscoveryActive && !deepSceneDiscovery.isProcessing())  {
+                deepSceneDiscovery.processFrame(bmp)
+                canProcess = true
+                return
+            }
+
             if (isImageMostlyUniform(bmp)) {
                 val msg = "You are going to hit something."
                 handleMessage(msg)
@@ -779,7 +860,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 return
             }
 
-            // Step 1: Detection based on active mode
             val (targetBox, position, depthMeters) = when {
                 shouldDetectDoors -> {
                     val (doorBox, pos) = detectDoor(bmp)
@@ -810,16 +890,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 else -> Triple(null, "", Float.MAX_VALUE)
             }
-            Log.d(TAG, "Detected: box=$targetBox, position=$position, depth=$depthMeters meters")
 
-            // Step 2: Obstacle detection on full image
             val fullDepthMap = runDepthEstimation(bmp)
             val obstacles = runSegmentation(bmp)
             val mappedObstacles = obstacles.map { obstacle ->
                 val mappedMask = mapMaskToOriginal(obstacle.mask, bmp.width, bmp.height)
                 Obstacle(obstacle.box, mappedMask, obstacle.className)
             }.filter {
-                // Filter out the target class
                 when {
                     shouldDetectDoors -> it.className != "door"
                     shouldDetectChairs -> it.className != "chair"
@@ -828,7 +905,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
 
-            // Step 3: Generate message
             val targetClass = when {
                 shouldDetectDoors -> "door"
                 shouldDetectChairs -> "chair"
@@ -846,9 +922,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     targetClass
                 )
             } else {
-                // No target detected, check for close obstacles
                 val closeObstacles = mappedObstacles.filter { obstacle ->
-                    val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask, bmp.width, bmp.height)
+                    val obstacleDepth = avgMaskDepthFixed(fullDepthMap, obstacle.mask)
                     val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
                     obstacleDepthMeters < PROXIMITY_THRESHOLD_M
                 }
@@ -860,7 +935,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
 
-            // Output results
             if (message.isNotEmpty()) {
                 handleMessage(message)
             }
@@ -872,29 +946,42 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * image.width
+
+        val bitmap = createBitmap(image.width + rowPadding / pixelStride, image.height)
+        bitmap.copyPixelsFromBuffer(buffer)
+
+        val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+
+        val rotationDegrees = image.imageInfo.rotationDegrees
+        return if (rotationDegrees != 0) {
+            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            Bitmap.createBitmap(croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, matrix, true)
+        } else {
+            croppedBitmap
+        }
+    }
+
     private fun handleMessage(message: String) {
-        // Update consecutive message count
         if (message == previousMessage) {
             consecutiveIdenticalCount++
             if (consecutiveIdenticalCount >= 5) {
-                // After 7th appearance (count 0 to 5), reset cycle
                 consecutiveIdenticalCount = 0
                 previousMessage = null
-                Log.d(TAG, "Reset cycle after 6 identical messages: '$message'")
             }
         } else {
-            // New message, reset count
             consecutiveIdenticalCount = 0
             previousMessage = message
         }
 
-        // Play and display message only on second appearance (count == 1)
         if (consecutiveIdenticalCount == 1) {
             speak(message)
             runOnUiThread { positionTextView.text = message }
-            Log.d(TAG, "Played and displayed message '$message' (second appearance)")
-        } else {
-            Log.d(TAG, "Skipped message '$message' (consecutive count: $consecutiveIdenticalCount)")
         }
     }
 
@@ -916,8 +1003,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return origMask
     }
 
-    private fun speak(msg: String) {
-        tts.stop() // Stop ongoing speech before speaking new message
+    fun speak(msg: String) {
+        tts.stop()
         val params = Bundle()
         params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "messageId")
         tts.speak(msg, TextToSpeech.QUEUE_FLUSH, params, "messageId")
@@ -932,14 +1019,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         bitmap: Bitmap,
         targetClass: String
     ): String {
-        // Use PROXIMITY_THRESHOLD_D (0.075m) for both doors and chairs
         val proximityThreshold = PROXIMITY_THRESHOLD_D
         if (depthMeters < proximityThreshold) {
             return "You have reached the $targetClass."
         }
 
         val blockingObstacles = obstacles.filter { obstacle ->
-            val obstacleDepth = avgMaskDepthFixed(depthMap, obstacle.mask, bitmap.width, bitmap.height)
+            val obstacleDepth = avgMaskDepthFixed(depthMap, obstacle.mask)
             val obstacleDepthMeters = if (obstacleDepth.isFinite()) DEPTH_SCALE_FACTOR / obstacleDepth else Float.MAX_VALUE
             obstacleDepthMeters < depthMeters && obstacleDepthMeters < PROXIMITY_THRESHOLD_M && isObstacleInPath(obstacle.box, targetBox)
         }
@@ -955,7 +1041,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val obstacleNames = blockingObstacles.joinToString(" and ") { it.className }
         return when (position) {
             "left" -> {
-                val rightHalf = Bitmap.createBitmap(bitmap, 320, 0, 320, 640)
+                val rightHalf = Bitmap.createBitmap(bitmap, bitmap.width / 2, 0, bitmap.width / 2, bitmap.height)
                 val rightObstacles = runSegmentation(rightHalf).filter { it.className != targetClass }
                 if (rightObstacles.isEmpty()) {
                     "The $targetClass is to your left, but there is $obstacleNames in the way. Move right to avoid it, then turn left."
@@ -965,7 +1051,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
             "right" -> {
-                val leftHalf = Bitmap.createBitmap(bitmap, 0, 0, 320, 640)
+                val leftHalf = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width / 2, bitmap.height)
                 val leftObstacles = runSegmentation(leftHalf).filter { it.className != targetClass }
                 if (leftObstacles.isEmpty()) {
                     "The $targetClass is to your right, but there is $obstacleNames in the way. Move left to avoid it, then turn right."
@@ -975,12 +1061,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
             else -> {
-                val rightThird = Bitmap.createBitmap(bitmap, 426, 0, 214, 640)
+                val rightThird = Bitmap.createBitmap(bitmap, bitmap.width * 2 / 3, 0, bitmap.width / 3, bitmap.height)
                 val rightObstacles = runSegmentation(rightThird).filter { it.className != targetClass }
                 if (rightObstacles.isEmpty()) {
                     "The $targetClass is straight ahead, but there is $obstacleNames in the way. Move right to avoid it, then continue forward."
                 } else {
-                    val leftThird = Bitmap.createBitmap(bitmap, 0, 0, 213, 640)
+                    val leftThird = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width / 3, bitmap.height)
                     val leftObstacles = runSegmentation(leftThird).filter { it.className != targetClass }
                     if (leftObstacles.isEmpty()) {
                         "The $targetClass is straight ahead, but there is $obstacleNames in the way. Move left to avoid it, then continue forward."
@@ -1021,9 +1107,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun avgMaskDepthFixed(
         depthMap: Array<FloatArray>,
-        mask: Array<FloatArray>,
-        imageWidth: Int,
-        imageHeight: Int
+        mask: Array<FloatArray>
     ): Float {
         var sum = 0f
         var cnt = 0
@@ -1072,10 +1156,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         return result
     }
-    @SuppressLint("SetTextI18n")
+
     private fun startDetection(type: String? = null) {
         if (type == null) {
-            // Prompt for icon selection
             isWaitingForIconSelection = true
             shouldDetect = false
             shouldDetectDoors = false
@@ -1089,9 +1172,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 positionTextView.text = "Choose detection type"
             }
             speak("Starting detection, press on the icon that you want to detect")
-            Log.d(TAG, "Prompting for icon selection")
         } else {
-            // Start specific detection mode
             isWaitingForIconSelection = false
             shouldDetect = true
             shouldDetectDoors = type == "door"
@@ -1106,12 +1187,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             speak("Starting detecting ${type}s")
             handler.post(detectionRunnable)
-            Log.d(TAG, "Started $type detection")
         }
     }
 
-    // Edited function: Resets state and hides icons
-    @SuppressLint("SetTextI18n")
     private fun stopDetection() {
         shouldDetect = false
         shouldDetectDoors = false
@@ -1128,7 +1206,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             positionTextView.text = "Detection stopped"
         }
         speak("Stopping detection")
-        Log.d(TAG, "Stopped detection")
+    }
+
+    private fun startDeepSceneDiscovery() {
+        stopDetection()
+        isDeepSceneDiscoveryActive = true
+        runOnUiThread {
+            detectButton.text = "Stop Detection"
+            positionTextView.text = "Deep Scene Discovery active"
+        }
+        speak("Starting Deep Scene Discovery")
+        deepSceneDiscovery.start()
+    }
+
+    private fun stopDeepSceneDiscovery() {
+        isDeepSceneDiscoveryActive = false
+        deepSceneDiscovery.stop()
+        isVoiceActive = false
+        hasGreeted = false
+        runOnUiThread {
+            detectButton.text = "Start Detection"
+            positionTextView.text = "Waiting for voice commands..."
+        }
     }
 
     private fun detectDoor(bitmap: Bitmap): Pair<RectF?, String> {
@@ -1139,8 +1238,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         inputBuffer.rewind()
         val outputs = Array(1) { Array(5) { FloatArray(8400) } }
         tflite.run(inputBuffer, outputs)
-        val threshold = 0.6f
-        val iouThresh = 0.4f
+        val threshold = 0.75f
+        val iouThresh = 0.6f
         val detections = mutableListOf<Triple<RectF, Float, String>>()
 
         for (i in 0 until 8400) {
@@ -1166,10 +1265,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     else -> "right"
                 }
                 detections.add(Triple(rect, confidence, position))
-                Log.d(
-                    TAG,
-                    "Detection $i: Confidence=$confidence, Box=[left=$left, top=$top, right=$right, bottom=$bottom], Position=$position"
-                )
             }
         }
 
@@ -1185,25 +1280,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val best = keep[0]
             val croppedBitmap = cropBitmap(bitmap, best.first)
             if (confirmDoorWithClassicalMethods(croppedBitmap)) {
-                Log.d(TAG, "Confirmed door: position=${best.third}, confidence=${best.second}")
                 return Pair(best.first, best.third)
             } else if (keep.size > 1) {
                 val secondBest = keep[1]
                 val secondCroppedBitmap = cropBitmap(bitmap, secondBest.first)
                 if (confirmDoorWithClassicalMethods(secondCroppedBitmap)) {
-                    Log.d(
-                        TAG,
-                        "Confirmed second-best door: position=${secondBest.third}, confidence=${secondBest.second}"
-                    )
                     return Pair(secondBest.first, secondBest.third)
                 }
             }
-            Log.d(TAG, "No door confirmed, using best detection: position=${best.third}")
             return Pair(best.first, best.third)
         }
-        Log.d(TAG, "No door detected")
         return Pair(null, "")
     }
+
     private fun detectChair(bitmap: Bitmap): Pair<RectF?, String> {
         val chairs = runSegmentationForChairs(bitmap)
         val sortedChairs = chairs.sortedByDescending { it.box.width() * it.box.height() }
@@ -1217,15 +1306,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 normalizedX < 0.66 -> "mid"
                 else -> "right"
             }
-            Log.d(TAG, "Chair detected: position=$position, box=${bestChair.box}")
             return Pair(bestChair.box, position)
         }
-
-        Log.d(TAG, "No chair detected")
         return Pair(null, "")
     }
 
-    // New function: Detect cars using segmentation
     private fun detectCar(bitmap: Bitmap): Pair<RectF?, String> {
         val cars = runSegmentationForCars(bitmap)
         val sortedCars = cars.sortedByDescending { it.box.width() * it.box.height() }
@@ -1239,11 +1324,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 normalizedX < 0.66 -> "mid"
                 else -> "right"
             }
-            Log.d(TAG, "Car detected: position=$position, box=${bestCar.box}")
             return Pair(bestCar.box, position)
         }
-
-        Log.d(TAG, "No car detected")
         return Pair(null, "")
     }
 
@@ -1278,63 +1360,58 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         val contours = mutableListOf<MatOfPoint>()
         val hierarchy = Mat()
-        Imgproc.findContours(
-            edges,
-            contours,
-            hierarchy,
-            Imgproc.RETR_EXTERNAL,
-            Imgproc.CHAIN_APPROX_SIMPLE
-        )
+        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
         for (contour in contours) {
             val approx = MatOfPoint2f()
-            Imgproc.approxPolyDP(
-                MatOfPoint2f(*contour.toArray()),
-                approx,
-                Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true) * 0.02,
-                true
-            )
+            Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true) * 0.02, true)
             if (approx.toArray().size == 4) {
                 val points = approx.toArray()
                 val rect = Imgproc.boundingRect(MatOfPoint(*points))
                 val aspectRatio = rect.height.toFloat() / rect.width
-                if (aspectRatio in 1.5..3.0) {
-                    if (verticalLines >= 2 && horizontalLines >= 2) {
-                        return true
-                    }
+                if (aspectRatio in 1.5..3.0 && verticalLines >= 2 && horizontalLines >= 2) {
+                    return true
                 }
             }
         }
         return false
     }
 
-    data class Obstacle(val box: RectF, val mask: Array<FloatArray>, val className: String)
+    data class Obstacle(val box: RectF, val mask: Array<FloatArray>, val className: String) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+
+            other as Obstacle
+
+            if (box != other.box) return false
+            if (!mask.contentDeepEquals(other.mask)) return false
+            if (className != other.className) return false
+
+            return true
+        }
+
+        override fun hashCode(): Int {
+            var result = box.hashCode()
+            result = 31 * result + mask.contentDeepHashCode()
+            result = 31 * result + className.hashCode()
+            return result
+        }
+    }
 
     private fun runSegmentation(roi: Bitmap): List<Obstacle> {
         try {
-            Log.d(TAG, "runSegmentation: ROI dimensions: ${roi.width}x${roi.height}")
             val ti = TensorImage(DataType.FLOAT32)
             ti.load(roi)
             val input = imageProcessor.process(ti).buffer
-            val inputArray = FloatArray(input.capacity() / 4).apply { input.asFloatBuffer().get(this) }
-            Log.d(
-                TAG,
-                "runSegmentation: Input pixel range: min=${inputArray.minOrNull()}, max=${inputArray.maxOrNull()}"
-            )
             val detShape = segInterpreter.getOutputTensor(0).shape()
             val protoShape = segInterpreter.getOutputTensor(1).shape()
             val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
-            val protoOut = Array(protoShape[0]) {
-                Array(protoShape[1]) {
-                    Array(protoShape[2]) {
-                        FloatArray(protoShape[3])
-                    }
-                }
-            }
+            val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
             val outputs = mapOf(0 to detOut, 1 to protoOut)
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
+            val threshold = 0.75f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1358,11 +1435,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         val idx = maskCoefsStartIdx + c
                         if (idx < detShape[1]) raw[idx][i] else 0f
                     }
-                    val className = if (maxClassIdx >= 0 && maxClassIdx < classNames.size) {
-                        classNames[maxClassIdx]
-                    } else {
-                        "Unknown"
-                    }
+                    val className = if (maxClassIdx >= 0 && maxClassIdx < classNames.size) classNames[maxClassIdx] else "Unknown"
                     dets += Triple(box, maskCoefs, className)
                 }
             }
@@ -1374,18 +1447,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             for ((box, coefs, className) in final) {
                 try {
                     val mask = Array(256) { FloatArray(256) }
-                    val maskValues = mutableListOf<Float>()
                     var activePixels = 0
                     for (dy in 0 until 256) {
                         for (dx in 0 until 256) {
-                            val py = (dy * protoH / 256).toInt().coerceIn(0, protoH - 1)
-                            val px = (dx * protoW / 256).toInt().coerceIn(0, protoW - 1)
+                            val py = (dy * protoH / 256).coerceIn(0, protoH - 1)
+                            val px = (dx * protoW / 256).coerceIn(0, protoW - 1)
                             var maskValue = 0f
                             for (c in 0 until minOf(coefs.size, protoC)) {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            maskValues.add(maskValue)
                             if (maskValue > 0.1f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
@@ -1394,22 +1465,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     }
                     if (activePixels >= 50) {
                         if ((shouldDetectCars && className == "car") || (shouldDetectChairs && className == "chair")) {
-                            Log.d(TAG, "Obstacle skipped: name=$className, not an obstacle when detecting this class")
                             continue
                         }
                         val dilatedMask = dilateArray(mask, 3)
                         obstacles.add(Obstacle(box, dilatedMask, className))
-                        Log.d(TAG, "Obstacle added: name=$className, size=$activePixels pixels")
-                    } else {
-                        Log.d(TAG, "Obstacle skipped: name=$className, too small, size=$activePixels pixels")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error building mask for $className: ${e.message}", e)
                 }
-            }
-            // Print names of all detected obstacles
-            obstacles.forEach { obstacle ->
-                Log.d(TAG, "Detected obstacle: ${obstacle.className}")
             }
             return obstacles
         } catch (e: Exception) {
@@ -1417,25 +1480,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return emptyList()
         }
     }
-    // New function to detect chairs using segmentation
+
     private fun runSegmentationForChairs(roi: Bitmap): List<Obstacle> {
         try {
-            Log.d(TAG, "runSegmentationForChairs: ROI dimensions: ${roi.width}x${roi.height}")
             val ti = TensorImage(DataType.FLOAT32).apply { load(roi) }
             val input = imageProcessor.process(ti).buffer
-            val inputArray = FloatArray(input.capacity() / 4).apply { input.asFloatBuffer().get(this) }
-            Log.d(TAG, "runSegmentationForChairs: Input pixel range: min=${inputArray.minOrNull()}, max=${inputArray.maxOrNull()}")
-
             val detShape = segInterpreter.getOutputTensor(0).shape()
             val protoShape = segInterpreter.getOutputTensor(1).shape()
             val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
             val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
             val outputs = mapOf(0 to detOut, 1 to protoOut)
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
-
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
+            val threshold = 0.75f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1476,7 +1534,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             for ((box, coefs, className) in finalDets) {
                 try {
                     val mask = Array(256) { FloatArray(256) }
-                    val maskValues = mutableListOf<Float>()
                     var activePixels = 0
                     for (dy in 0 until 256) {
                         for (dx in 0 until 256) {
@@ -1487,7 +1544,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            maskValues.add(maskValue)
                             if (maskValue > 0.1f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
@@ -1497,15 +1553,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (activePixels >= 50) {
                         val dilatedMask = dilateArray(mask, 3)
                         obstacles.add(Obstacle(box, dilatedMask, className))
-                        Log.d(TAG, "Chair added: name=$className, size=$activePixels pixels")
-                    } else {
-                        Log.d(TAG, "Chair skipped: name=$className, too small, size=$activePixels pixels")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error building mask for $className: ${e.message}", e)
                 }
             }
-            obstacles.forEach { Log.d(TAG, "Detected chair: ${it.className}") }
             return obstacles
         } catch (e: Exception) {
             Log.e(TAG, "Chair segmentation error: ${e.message}", e)
@@ -1513,25 +1565,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    // New function: Run segmentation specifically for cars
     private fun runSegmentationForCars(roi: Bitmap): List<Obstacle> {
         try {
-            Log.d(TAG, "runSegmentationForCars: ROI dimensions: ${roi.width}x${roi.height}")
             val ti = TensorImage(DataType.FLOAT32).apply { load(roi) }
             val input = imageProcessor.process(ti).buffer
-            val inputArray = FloatArray(input.capacity() / 4).apply { input.asFloatBuffer().get(this) }
-            Log.d(TAG, "runSegmentationForCars: Input pixel range: min=${inputArray.minOrNull()}, max=${inputArray.maxOrNull()}")
-
             val detShape = segInterpreter.getOutputTensor(0).shape()
             val protoShape = segInterpreter.getOutputTensor(1).shape()
             val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
             val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
             val outputs = mapOf(0 to detOut, 1 to protoOut)
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
-
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
+            val threshold = 0.75f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1572,7 +1618,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             for ((box, coefs, className) in finalDets) {
                 try {
                     val mask = Array(256) { FloatArray(256) }
-                    val maskValues = mutableListOf<Float>()
                     var activePixels = 0
                     for (dy in 0 until 256) {
                         for (dx in 0 until 256) {
@@ -1583,7 +1628,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            maskValues.add(maskValue)
                             if (maskValue > 0.1f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
@@ -1593,15 +1637,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (activePixels >= 50) {
                         val dilatedMask = dilateArray(mask, 3)
                         obstacles.add(Obstacle(box, dilatedMask, className))
-                        Log.d(TAG, "Car added: name=$className, size=$activePixels pixels")
-                    } else {
-                        Log.d(TAG, "Car skipped: name=$className, too small, size=$activePixels pixels")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error building mask for $className: ${e.message}", e)
                 }
             }
-            obstacles.forEach { Log.d(TAG, "Detected car: ${it.className}") }
             return obstacles
         } catch (e: Exception) {
             Log.e(TAG, "Car segmentation error: ${e.message}", e)
@@ -1609,14 +1649,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-
-
     private fun applyNMS(
         dets: List<Triple<RectF, FloatArray, String>>,
         iouThresh: Float
     ): List<Triple<RectF, FloatArray, String>> {
         if (dets.isEmpty()) return emptyList()
-        val sorted = dets.sortedByDescending { it.second.sumByDouble { v: Float -> v.toDouble() }.toFloat() }
+        val sorted = dets.sortedByDescending { it.second.sumOf { v: Float -> v.toDouble() }.toFloat() }
         val keep = mutableListOf<Triple<RectF, FloatArray, String>>()
         for ((box, coefs, className) in sorted) {
             if (keep.none { iou(it.first, box) > iouThresh }) {
@@ -1638,38 +1676,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun runDepthEstimation(bmp: Bitmap): Array<FloatArray> {
         try {
-            Log.d(TAG, "runDepthEstimation: Input bitmap dimensions: ${bmp.width}x${bmp.height}")
             val ti = TensorImage(DataType.FLOAT32)
             ti.load(bmp)
             val input = depthProcessor.process(ti).buffer
             val outShape = depthInterpreter.getOutputTensor(0).shape()
-            val depthMap = if (outShape.size == 4) {
-                val raw = Array(outShape[0]) {
-                    Array(outShape[1]) {
-                        Array(outShape[2]) {
-                            FloatArray(outShape[3])
-                        }
-                    }
+            val depthMap = when (outShape.size) {
+                4 -> {
+                    val raw = Array(outShape[0]) { Array(outShape[1]) { Array(outShape[2]) { FloatArray(outShape[3]) } } }
+                    depthInterpreter.run(input, raw)
+                    Array(outShape[1]) { y -> FloatArray(outShape[2]) { x -> raw[0][y][x][0] } }
                 }
-                depthInterpreter.run(input, raw)
-                Array(outShape[1]) { y -> FloatArray(outShape[2]) { x -> raw[0][y][x][0] } }
-            } else if (outShape.size == 3) {
-                val raw = Array(outShape[0]) { Array(outShape[1]) { FloatArray(outShape[2]) } }
-                depthInterpreter.run(input, raw)
-                raw[0]
-            } else {
-                Log.e(TAG, "Unsupported depth output shape: ${outShape.joinToString()}")
-                Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) { Float.MAX_VALUE } }
-            }
-            var minDepth = Float.MAX_VALUE
-            var maxDepth = Float.MIN_VALUE
-            for (y in depthMap.indices) {
-                for (x in depthMap[0].indices) {
-                    minDepth = min(minDepth, depthMap[y][x])
-                    maxDepth = max(maxDepth, depthMap[y][x])
+                3 -> {
+                    val raw = Array(outShape[0]) { Array(outShape[1]) { FloatArray(outShape[2]) } }
+                    depthInterpreter.run(input, raw)
+                    raw[0]
+                }
+                else -> {
+                    Log.e(TAG, "Unsupported depth output shape: ${outShape.joinToString()}")
+                    Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) { Float.MAX_VALUE } }
                 }
             }
-            Log.d(TAG, "runDepthEstimation: Depth map range: min=$minDepth, max=$maxDepth")
             return depthMap
         } catch (e: Exception) {
             Log.e(TAG, "Depth estimation error: ${e.message}", e)
@@ -1701,7 +1727,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         variance /= pixels.size
         val varianceThreshold = 1000f
-        Log.d(TAG, "Image variance: $variance, threshold: $varianceThreshold")
         return variance < varianceThreshold
     }
 
@@ -1712,30 +1737,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (requestCode == 1001) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
                 startCamera()
-                startVoiceRecognition() // Start SpeechRecognizer after permissions granted
+                startVoiceRecognition()
                 if (!isInternetAvailable()) {
-                    Log.w(TAG, "No internet connection available")
-                    initialOfflineWarningSent = true // Set flag for TTS warning
+                    initialOfflineWarningSent = true
                 }
             } else {
-                val deniedPermissions = permissions.filterIndexed { index, permission ->
+                val deniedPermissions = permissions.filterIndexed { index, _ ->
                     grantResults[index] != PackageManager.PERMISSION_GRANTED
                 }
                 val errorMessage = when {
-                    deniedPermissions.contains(Manifest.permission.CAMERA) && deniedPermissions.contains(
-                        Manifest.permission.RECORD_AUDIO
-                    ) ->
+                    deniedPermissions.contains(Manifest.permission.CAMERA) && deniedPermissions.contains(Manifest.permission.RECORD_AUDIO) ->
                         "Camera and audio permissions denied"
-
                     deniedPermissions.contains(Manifest.permission.CAMERA) ->
                         "Camera permission denied"
-
                     deniedPermissions.contains(Manifest.permission.RECORD_AUDIO) ->
                         "Audio permission denied"
-
                     else -> "Required permissions denied"
                 }
-                Log.e(TAG, errorMessage)
                 runOnUiThread { positionTextView.text = errorMessage }
             }
         }
@@ -1743,12 +1761,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "Destroying activity")
         handler.removeCallbacksAndMessages(null)
         if (::speechRecognizer.isInitialized) {
             speechRecognizer.stopListening()
             speechRecognizer.destroy()
-            Log.d(TAG, "SpeechRecognizer destroyed")
         }
         if (::tflite.isInitialized) {
             tflite.close()
