@@ -28,6 +28,7 @@ class DeepSceneDiscovery(private val context: Context) {
 
     init {
         try {
+            // Final Model
             val modelName = "gemini-2.5-flash-preview-05-20"
             val apiKey = BuildConfig.GEMINI_API_KEY
             val generationConfig = generationConfig {
