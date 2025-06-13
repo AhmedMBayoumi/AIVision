@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
@@ -14,17 +13,57 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <ImageView
+        android:id="@+id/leftArrowImageView"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
+        android:layout_marginStart="16dp"
+        android:alpha="1.0"
+        android:contentDescription="@string/todo"
+        android:src="@drawable/ic_arrow_left"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <ImageView
+        android:id="@+id/rightArrowImageView"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
+        android:layout_marginEnd="16dp"
+        android:alpha="1.0"
+        android:contentDescription="@string/todo2"
+        android:src="@drawable/ic_arrow_right"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
     <TextView
         android:id="@+id/positionTextView"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginBottom="16dp"
-        android:text="No door detected"
+        android:text="@string/no_door_detected"
         android:textColor="@android:color/white"
-        android:textSize="18sp"
+        android:textSize="16sp"
         android:background="@android:color/transparent"
         android:gravity="center"
         app:layout_constraintBottom_toTopOf="@id/detectButton"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/swipeInstructionTextView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:background="@android:color/transparent"
+        android:padding="8dp"
+        android:text="@string/swipe_down_to_stop_detecting"
+        android:textColor="@android:color/white"
+        android:textSize="18sp"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -33,12 +72,11 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginBottom="16dp"
-        android:text="Detect Door"
+        android:text="@string/detect_door"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Circular Icon Buttons on the right side -->
     <ImageButton
         android:id="@+id/chairButton"
         android:layout_width="56dp"
@@ -47,7 +85,7 @@
         android:background="@drawable/circular_button_background"
         android:src="@drawable/ic_chair"
         android:scaleType="centerInside"
-        android:contentDescription="Chair detection"
+        android:contentDescription="@string/chair_detection"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toTopOf="@id/carButton"
@@ -62,7 +100,7 @@
         android:background="@drawable/circular_button_background"
         android:src="@drawable/ic_car"
         android:scaleType="centerInside"
-        android:contentDescription="Car detection"
+        android:contentDescription="@string/car_detection"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@id/chairButton"
         app:layout_constraintBottom_toTopOf="@id/doorButton" />
@@ -76,9 +114,36 @@
         android:background="@drawable/circular_button_background"
         android:src="@drawable/ic_door"
         android:scaleType="centerInside"
-        android:contentDescription="Door detection"
+        android:contentDescription="@string/door_detection"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@id/carButton"
         app:layout_constraintBottom_toBottomOf="parent" />
+
+    <View
+        android:id="@+id/cameraSwitchOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@android:color/black"
+        android:visibility="gone"
+        android:alpha="0"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
+        android:id="@+id/lowLightWarningTextView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/not_enough_lighting_double_tap_to_toggle_flash"
+        android:textColor="@android:color/white"
+        android:textSize="18sp"
+        android:visibility="gone"
+        android:textAlignment="center"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintVertical_bias="0.3" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

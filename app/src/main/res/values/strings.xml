@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">AIVision</string>
+    <string name="no_door_detected">No door detected</string>
+    <string name="swipe_down_to_stop_detecting">Swipe down to stop detecting</string>
+    <string name="detect_door">Detect Door</string>
+    <string name="chair_detection">Chair detection</string>
+    <string name="car_detection">Car detection</string>
+    <string name="door_detection">Door detection</string>
+    <string name="not_enough_lighting_double_tap_to_toggle_flash">Not enough lighting, double tap to toggle flash</string>
+    <string name="todo">TODO</string>
+    <string name="todo2">TODO2</string>
 </resources>

@@ -5,7 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import com.google.ai.client.generativeai.GenerativeModel
-import com.google.ai.client.generativeai.type.generationConfig // Make sure this import is present
+import com.google.ai.client.generativeai.type.generationConfig
 import com.google.ai.client.generativeai.type.content
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,15 +21,15 @@ class DeepSceneDiscovery(private val context: Context) {
     @Volatile
     private var isProcessing = false
 
+    @Volatile
+    private var readyToProcess = false
+
     private lateinit var generativeModel: GenerativeModel
 
     init {
         try {
-
-            val modelName = "gemini-2.0-flash"
-//            val apiKey = BuildConfig.GEMINI_API_KEY // This should now work
-            val apiKey = "AIzaSyCypNFKB74uZXjZCa73Yd62CwHRXnl2vXM"
-            // CORRECTED: Use the Kotlin DSL for generationConfig
+            val modelName = "gemini-2.5-flash-preview-05-20"
+            val apiKey = BuildConfig.GEMINI_API_KEY
             val generationConfig = generationConfig {
                 temperature = 0.4f
                 topK = 32
@@ -49,26 +49,40 @@ class DeepSceneDiscovery(private val context: Context) {
 
     fun start() {
         isProcessing = false
+        readyToProcess = false
         Log.d(TAG, "Deep Scene Discovery started")
+
+        (context as MainActivity).runOnUiThread {
+            context.swipeInstructionTextView.text = "Swipe Down to Stop Detecting"
+            context.swipeInstructionTextView.visibility = android.view.View.VISIBLE
+            Log.d(TAG, "Set swipeInstructionTextView to VISIBLE")
+        }
+        context.speak("Starting Deep Scene Discovery")
     }
 
     fun stop() {
-        isProcessing = true
+        isProcessing = false
+        readyToProcess = false
         Log.d(TAG, "Deep Scene Discovery stopped")
-    }
 
-    fun isProcessing(): Boolean {
-        return isProcessing
+        (context as MainActivity).runOnUiThread {
+            context.swipeInstructionTextView.visibility = android.view.View.GONE
+            Log.d(TAG, "Set swipeInstructionTextView to GONE")
+        }
     }
 
     fun onSpeechFinished() {
         isProcessing = false
+        if (!readyToProcess) {
+            readyToProcess = true
+            Log.d(TAG, "Startup announcement finished. Ready to process frames.")
+        }
         Log.d(TAG, "Speech finished. Ready for next frame.")
     }
 
-
     fun processFrame(bitmap: Bitmap) {
-        if (isProcessing) {
+        if (isProcessing || !readyToProcess) {
+            Log.d(TAG, "Skipping frame processing: isProcessing=$isProcessing, readyToProcess=$readyToProcess")
             return
         }
 
@@ -81,7 +95,7 @@ class DeepSceneDiscovery(private val context: Context) {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val prompt = "Explain the scene and explain the path to take to reach the door."
+                val prompt = "briefly describe the scene in front of the camera. if you see a paper say that there is a paper and try to read what is in it and if you can not read just say there is a paper with contents that is not clear. Additionally, if you see a door, car or a chair explain the path i should take to reach the it and how to avoid anything i can bump into. if there is no object from what i talked about then do not say anything about them and only describe the scene. do not use any introduction or ending just generate what i asked for."
 
                 val inputContent = content {
                     image(bitmap)
@@ -91,15 +105,16 @@ class DeepSceneDiscovery(private val context: Context) {
                 val response = generativeModel.generateContent(inputContent)
 
                 response.text?.let {
+                    if (!isProcessing) return@let
                     Log.d(TAG, "Gemini Response: $it")
-                    (context as MainActivity).runOnUiThread {
-                        (context as MainActivity).speak(it)
+                    context.runOnUiThread {
+                        context.speak(it)
                         context.positionTextView.text = it
                     }
                 } ?: run {
                     Log.e(TAG, "Gemini response was null.")
-                    (context as MainActivity).runOnUiThread {
-                        (context as MainActivity).speak("I could not analyze the scene.")
+                    context.runOnUiThread {
+                        context.speak("I could not analyze the scene.")
                         context.positionTextView.text = "Error: Null response from API."
                     }
                     onSpeechFinished()
@@ -107,9 +122,9 @@ class DeepSceneDiscovery(private val context: Context) {
 
             } catch (e: Exception) {
                 Log.e(TAG, "Error calling Gemini API: ${e.message}", e)
-                (context as MainActivity).runOnUiThread {
+                context.runOnUiThread {
                     context.positionTextView.text = "Error: ${e.message}"
-                    (context as MainActivity).speak("There was an error.")
+                    context.speak("There was an error.")
                 }
                 onSpeechFinished()
             }

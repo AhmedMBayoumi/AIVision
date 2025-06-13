@@ -1,12 +1,18 @@
 package com.amb.aivision
 
 import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.annotation.SuppressLint
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import java.util.*
 import android.content.res.Configuration
 import android.graphics.*
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -20,11 +26,10 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.util.Size
-import android.view.Surface
-import android.view.View
-import android.view.WindowManager
+import android.view.*
 import android.widget.Button
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
@@ -36,8 +41,10 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.createBitmap
 import androidx.core.view.WindowCompat
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
@@ -54,11 +61,13 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
-import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.*
-import androidx.core.graphics.createBitmap
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
 
 private const val TAG = "DoorDetection"
 
@@ -68,10 +77,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     companion object {
         private const val PROCESSING_SIZE = 256         // for seg & depth
         private const val PROXIMITY_THRESHOLD_M = 0.5f  // 0.75 meters for obstacles
-        private const val PROXIMITY_THRESHOLD_D = 0.075f // Close to door
+        private const val PROXIMITY_THRESHOLD_D = 0.1f // Close to door
         private const val DETECTION_RESOLUTION = 640   // For door detection
         private const val DEPTH_SCALE_FACTOR = 100.0f   // For MiDaS depth to meters
-        private const val DETECTION_INTERVAL_MS = 400L // 0.4 second for both
+        private const val DETECTION_INTERVAL_MS = 333L
+        private const val ANIMATION_DURATION = 200L // Animation duration for camera switch
     }
 
     private val classNames = listOf(
@@ -88,11 +98,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
         "toothbrush"
     )
+    private val detectionModes = listOf("door", "chair", "car")
+    private var currentDetectionIndex = 0
 
-    private lateinit var previewView: PreviewView
-    lateinit var positionTextView: TextView
-    private lateinit var detectButton: Button
+    private val previewView: PreviewView by lazy { findViewById(R.id.previewView) }
+    val positionTextView: TextView by lazy { findViewById(R.id.positionTextView) }
+    private val detectButton: Button by lazy { findViewById(R.id.detectButton) }
+    private val cameraSwitchOverlay: View by lazy { findViewById(R.id.cameraSwitchOverlay) }
+    internal val swipeInstructionTextView: TextView by lazy { findViewById(R.id.swipeInstructionTextView) }
+    private val chairButton: ImageButton by lazy { findViewById(R.id.chairButton) }
+    private val carButton: ImageButton by lazy { findViewById(R.id.carButton) }
+    private val doorButton: ImageButton by lazy { findViewById(R.id.doorButton) }
+    private val lowLightWarningTextView: TextView by lazy { findViewById(R.id.lowLightWarningTextView) }
+
+    private val leftArrowImageView: ImageView by lazy { findViewById(R.id.leftArrowImageView) }
+    private val rightArrowImageView: ImageView by lazy { findViewById(R.id.rightArrowImageView) }
     private lateinit var speechRecognizer: SpeechRecognizer
+    private lateinit var gestureDetector: GestureDetector
+    private lateinit var tts: TextToSpeech
 
     private var lastDetectionTime = 0L
     private var isSpeaking = false
@@ -101,7 +124,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var previousMessage: String? = null
     private var consecutiveIdenticalCount = 0
 
-    private lateinit var tts: TextToSpeech
     private var shouldDetectDoors = false
     private var shouldDetectCars = false
     private var shouldDetectChairs = false
@@ -128,11 +150,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var hasGreeted = false
     private var hasSpokenOfflineWarning = false
     private var hasSpokenDoorWarning = false
-    private var cameraProvider: ProcessCameraProvider? = null
     private var wasDetectingBeforePause = false
-    private lateinit var chairButton: ImageButton
-    private lateinit var carButton: ImageButton
-    private lateinit var doorButton: ImageButton
+
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: androidx.camera.core.Camera? = null
+    private var mainCameraSelector: CameraSelector? = null
+    private var ultraWideCameraSelector: CameraSelector? = null
+    private var activeCameraSelector: CameraSelector? = null
+    private var isFlashOn = false
+    private var isSwitchingCamera = false // Flag to prevent rapid switching
+
+
 
     private lateinit var deepSceneDiscovery: DeepSceneDiscovery
 
@@ -140,7 +168,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val detectionRunnable = object : Runnable {
         override fun run() {
             if (shouldDetect) {
-                triggerDetection()
                 handler.postDelayed(this, DETECTION_INTERVAL_MS)
             }
         }
@@ -152,7 +179,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     @SuppressLint("MissingPermission")
     private fun isInternetAvailable(): Boolean {
         val connectivityManager =
-            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = connectivityManager.activeNetwork ?: return false
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
@@ -162,23 +189,34 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var numDetections: Int = 0
     private var isWaitingForIconSelection = false
 
-
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (OpenCVLoader.initLocal()) {
+            org.opencv.core.Core.setNumThreads(1)
             Log.d(TAG, "OpenCV loaded successfully")
         } else {
             Log.e(TAG, "Failed to load OpenCV")
         }
         setContentView(R.layout.activity_main)
+        previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
 
-        previewView = findViewById(R.id.previewView)
-        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-        positionTextView = findViewById(R.id.positionTextView)
-        detectButton = findViewById(R.id.detectButton)
-        chairButton = findViewById(R.id.chairButton)
-        carButton = findViewById(R.id.carButton)
-        doorButton = findViewById(R.id.doorButton)
+        window.decorView.setOnApplyWindowInsetsListener { _, insets ->
+            val topInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()).top
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                @Suppress("DEPRECATION")
+                insets.displayCutout?.safeInsetTop ?: insets.systemWindowInsetTop
+            } else {
+                (24 * resources.displayMetrics.density).toInt()
+            }
+            (swipeInstructionTextView.layoutParams as ConstraintLayout.LayoutParams).apply {
+                topMargin = topInset + (8 * resources.displayMetrics.density).toInt()
+            }
+            swipeInstructionTextView.requestLayout()
+            insets
+        }
+
         detectButton.text = "Start Detection"
         chairButton.visibility = View.GONE
         carButton.visibility = View.GONE
@@ -186,6 +224,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         deepSceneDiscovery = DeepSceneDiscovery(this)
+
+        setupGestureDetector()
+
+        previewView.setOnTouchListener { _, event ->
+            gestureDetector.onTouchEvent(event)
+            true
+        }
 
         doorButton.setOnClickListener { startDetection("door") }
         chairButton.setOnClickListener { startDetection("chair") }
@@ -196,6 +241,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             true
         }
 
+        // --- MODIFICATION: Check if launched as an assistant ---
+        if (intent?.action == Intent.ACTION_ASSIST) {
+            isVoiceActive = true
+        }
+
+        requestPermissions()
+    }
+
+    private fun requestPermissions() {
         val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -214,47 +268,299 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun cycleDetection(goForward: Boolean) {
+        if (goForward) { // Swipe Right to move to the next item
+            currentDetectionIndex++
+            if (currentDetectionIndex >= detectionModes.size) {
+                currentDetectionIndex = 0 // Wrap around to the start
+            }
+        } else { // Swipe Left to move to the previous item
+            currentDetectionIndex--
+            if (currentDetectionIndex < 0) {
+                currentDetectionIndex = detectionModes.size - 1 // Wrap around to the end
+            }
+        }
+        val newDetectionType = detectionModes[currentDetectionIndex]
+        startDetection(newDetectionType)
+    }
+
+    private fun setupGestureDetector() {
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(
+                e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float
+            ): Boolean {
+                if (e1 == null || isSwitchingCamera) return false
+
+                val deltaX = e2.x - e1.x
+                val deltaY = e2.y - e1.y
+
+                if (abs(deltaX) > abs(deltaY)) {
+                    // --- HORIZONTAL SWIPE LOGIC ---
+                    if (abs(deltaX) > 100 && abs(velocityX) > 100) {
+                        if (shouldDetect) {
+                            if (deltaX > 0) {
+                                // Swipe Right
+                                cycleDetection(goForward = true)
+                            } else {
+                                // Swipe Left
+                                cycleDetection(goForward = false)
+                            }
+                        }
+                        return true
+                    }
+                } else {
+                    if (abs(deltaY) > 200 && abs(velocityY) > 100) {
+                        if (deltaY > 0) { // Swipe Down
+                            if (shouldDetect || isDeepSceneDiscoveryActive) {
+                                if (isDeepSceneDiscoveryActive) stopDeepSceneDiscovery() else stopDetection()
+                                speak("Stopping detection.")
+                            }
+                        }
+                        return true
+                    }
+                }
+                return false
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (isSwitchingCamera) return true
+
+                isFlashOn = !isFlashOn
+
+                if (isFlashOn) {
+                    val targetSelector = mainCameraSelector
+                    if (targetSelector == null) {
+                        speak("Flash not available.")
+                        isFlashOn = false
+                        return true
+                    }
+                    speak("Flash on")
+                    if (activeCameraSelector == targetSelector) {
+                        camera?.cameraControl?.enableTorch(true)
+                    } else {
+                        animateAndSwitchCamera(targetSelector, turnFlashOn = true)
+                    }
+                } else {
+                    val targetSelector = ultraWideCameraSelector
+                    if (targetSelector == null) {
+                        camera?.cameraControl?.enableTorch(false)
+                        speak("Flash off")
+                        return true
+                    }
+                    speak("Flash off")
+                    if (activeCameraSelector == targetSelector) {
+                        camera?.cameraControl?.enableTorch(false)
+                    } else {
+                        camera?.cameraControl?.enableTorch(false)
+                        animateAndSwitchCamera(targetSelector, turnFlashOn = false)
+                    }
+                }
+                return true
+            }
+        })
+    }
+
     private fun initializeComponents() {
         Log.d(TAG, "Initializing components")
         setupFullscreenUI()
         setupProcessors()
-        if (!loadModels()) {
-            positionTextView.text = "Failed to load models. Please check the app configuration."
-            detectButton.isEnabled = false
-            return
+        runOnUiThread {
+            if (!loadModels()) {
+                positionTextView.text = "Failed to load models. Please check the app configuration."
+                detectButton.isEnabled = false
+                return@runOnUiThread
+            }
         }
 
-        if (::tts.isInitialized) {
-            tts.shutdown()
-        }
+        if (::tts.isInitialized) tts.shutdown()
         tts = TextToSpeech(this, this)
-
         initSpeechRecognizer()
-        Log.d(TAG, "SpeechRecognizer initialized in initializeComponents")
 
         if (!isInternetAvailable()) {
             Log.w(TAG, "No internet connection available")
             initialOfflineWarningSent = true
         }
         startCamera()
-        // Delay startVoiceRecognition to ensure SpeechRecognizer is ready
+
         handler.postDelayed({
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 startVoiceRecognition()
             }
         }, 100L)
+    }
 
-        if (wasDetectingBeforePause && !shouldDetect) {
-            shouldDetect = true
-            shouldDetectDoors = true
-            detectButton.text = "Stop detecting"
-            handler.post(detectionRunnable)
+    private fun isLowLight(bitmap: Bitmap, threshold: Int = 60): Boolean {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        var totalLuminance = 0.0
+        for (pixel in pixels) {
+            val r = Color.red(pixel)
+            val g = Color.green(pixel)
+            val b = Color.blue(pixel)
+            totalLuminance += (0.299 * r + 0.587 * g + 0.114 * b)
+        }
+        val avgLuminance = totalLuminance / pixels.size
+        return avgLuminance < threshold
+    }
+
+    private fun triggerHapticFeedback() {
+        val vibrator = getSystemService(Vibrator::class.java)
+        if (vibrator.hasVibrator()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val vibrationEffect = VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE)
+                vibrator.vibrate(vibrationEffect)
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(1000)
+            }
         }
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun findCameraSelectors() {
+        val cameraProvider = this.cameraProvider ?: return
+        val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+
+        val backCameras = cameraProvider.availableCameraInfos.filter {
+            it.lensFacing == CameraSelector.LENS_FACING_BACK
+        }
+
+        if (backCameras.isEmpty()) {
+            Log.e(TAG, "No back cameras found!")
+            val defaultSelector = CameraSelector.DEFAULT_BACK_CAMERA
+            mainCameraSelector = defaultSelector
+            ultraWideCameraSelector = defaultSelector
+            return
+        }
+
+        val mainCamInfo = backCameras.firstOrNull { it.hasFlashUnit() } ?: backCameras.first()
+        mainCameraSelector = CameraSelector.Builder().addCameraFilter {
+            it.filter { camInfo -> camInfo == mainCamInfo }
+        }.build()
+
+        var ultraWideCamInfo: CameraInfo? = mainCamInfo // Default to main
+        var minFocalLength = Float.MAX_VALUE
+        for (cameraInfo in backCameras) {
+            try {
+                val characteristics = cameraManager.getCameraCharacteristics(Camera2CameraInfo.from(cameraInfo).cameraId)
+                val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                val currentMinFocal = focalLengths?.minOrNull() ?: Float.MAX_VALUE
+                if (currentMinFocal < minFocalLength) {
+                    minFocalLength = currentMinFocal
+                    ultraWideCamInfo = cameraInfo
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not get characteristics for a camera.", e)
+            }
+        }
+
+        ultraWideCameraSelector = CameraSelector.Builder().addCameraFilter {
+            it.filter { camInfo -> camInfo == ultraWideCamInfo }
+        }.build()
+    }
+
+    private fun animateAndSwitchCamera(selector: CameraSelector, turnFlashOn: Boolean) {
+        if (isSwitchingCamera) return
+        isSwitchingCamera = true
+
+        cameraSwitchOverlay.visibility = View.VISIBLE
+        cameraSwitchOverlay.animate()
+            .alpha(1f)
+            .setDuration(ANIMATION_DURATION)
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    // Switch camera now that the screen is black
+                    bindCameraUseCases(selector, turnFlashOn)
+                }
+            })
+            .start()
+    }
+
+    private fun bindCameraUseCases(selector: CameraSelector, turnFlashOn: Boolean) {
+        val cameraProvider = this.cameraProvider ?: run {
+            isSwitchingCamera = false
+            return
+        }
+        try {
+            cameraProvider.unbindAll()
+
+            camera = cameraProvider.bindToLifecycle(
+                this,
+                selector,
+                preview,
+                analysis
+            )
+
+            this.activeCameraSelector = selector
+
+            if (turnFlashOn) {
+                camera?.cameraControl?.enableTorch(true)
+            }
+
+            handler.postDelayed({
+                cameraSwitchOverlay.animate()
+                    .alpha(0f)
+                    .setDuration(ANIMATION_DURATION)
+                    .setListener(object : AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: Animator) {
+                            cameraSwitchOverlay.visibility = View.GONE
+                            isSwitchingCamera = false // Allow switching again
+                        }
+                    })
+                    .start()
+            }, 700)
+
+        } catch (exc: Exception) {
+            Log.e(TAG, "Use case binding failed", exc)
+            isSwitchingCamera = false
+        }
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            cameraProvider = cameraProviderFuture.get()
+
+            val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display?.rotation ?: Surface.ROTATION_0
+            } else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay.rotation
+            }
+
+            preview = Preview.Builder().setTargetRotation(rotation).build()
+                .also { it.surfaceProvider = previewView.surfaceProvider }
+
+            analysis = ImageAnalysis.Builder()
+                .setTargetRotation(rotation)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder().setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(640, 640),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    ).build()
+                )
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also { it.setAnalyzer(cameraExecutor, ::onFrame) }
+
+            findCameraSelectors()
+            val initialSelector = ultraWideCameraSelector ?: mainCameraSelector ?: CameraSelector.DEFAULT_BACK_CAMERA
+            bindCameraUseCases(initialSelector, false)
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    //region Unchanged Methods
     private fun startVoiceRecognition() {
         if (isRecognizerListening || isSpeaking || ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "startVoiceRecognition skipped: isRecognizerListening=$isRecognizerListening, isSpeaking=$isSpeaking, permissionGranted=${ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED}")
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                runOnUiThread { positionTextView.text = "Audio permission denied. Please grant permission." }
+            }
             return
         }
 
@@ -263,13 +569,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             runOnUiThread {
                 detectButton.visibility = View.VISIBLE
                 detectButton.isEnabled = true
+                if (!hasSpokenOfflineWarning) {
+                    speak("No internet connection. Voice recognition unavailable.")
+                    hasSpokenOfflineWarning = true
+                }
             }
-            if (!hasSpokenOfflineWarning) {
-                speak("No internet connection. Voice recognition unavailable.")
-                hasSpokenOfflineWarning = true
-            }
-            handler.postDelayed({ startVoiceRecognition() }, 5000L)
-            return
+            return // Exit early instead of retrying
         }
 
         hasSpokenOfflineWarning = false
@@ -277,7 +582,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             detectButton.visibility = View.GONE
             detectButton.isEnabled = true
             if (!hasSpokenDoorWarning) {
-                positionTextView.text = "Listening for commands..."
+                positionTextView.text = "Listening..."
             }
         }
 
@@ -291,8 +596,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 10000L) // 10 seconds
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true) // Optional: for smoother feedback
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 15000L) // Increase to 15 seconds
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
         try {
             Log.d(TAG, "Starting voice recognition with intent: $intent")
@@ -308,6 +614,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun initSpeechRecognizer() {
         if (::speechRecognizer.isInitialized) {
             Log.d(TAG, "Destroying existing SpeechRecognizer")
+            speechRecognizer.stopListening()
             speechRecognizer.destroy()
         }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
@@ -328,7 +635,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             override fun onEndOfSpeech() {
                 isRecognizerListening = false
                 Log.d(TAG, "SpeechRecognizer detected end of speech")
-                // Restart immediately to minimize pause
                 if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
                     startVoiceRecognition()
                 }
@@ -337,16 +643,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             override fun onError(error: Int) {
                 isRecognizerListening = false
                 Log.e(TAG, "SpeechRecognizer error: $error")
-                // Only restart for critical errors
                 when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                        // Ignore transient errors (no speech or timeout)
                         if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
-                            startVoiceRecognition() // Immediate restart
+                            handler.postDelayed({ startVoiceRecognition() }, 1000L) // Add 1s delay
                         }
                     }
                     else -> {
-                        // For other errors, use a delay to avoid rapid retries
                         if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
                             handler.postDelayed({ startVoiceRecognition() }, 100L)
                         }
@@ -363,9 +666,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         processVoiceCommand(spokenText)
                     }
                 }
-                // Only restart if still in listening mode
                 if (!isSpeaking && (isVoiceActive || !shouldDetect)) {
-                    startVoiceRecognition() // Immediate restart
+                    startVoiceRecognition()
                 }
             }
 
@@ -379,13 +681,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onResume() {
         super.onResume()
-        // Always re-initialize the recognizer on resume
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             initSpeechRecognizer()
         }
 
         if (isFirstLaunch) {
-            // On the very first launch, set the initial state
             isFirstLaunch = false
             shouldDetect = false
             shouldDetectDoors = false
@@ -394,16 +694,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             isDeepSceneDiscoveryActive = false
             detectButton.text = "Detect"
             runOnUiThread { positionTextView.text = "Waiting for voice commands..." }
-            handler.postDelayed({ startVoiceRecognition() }, 100L) // Start listening
+            handler.postDelayed({ startVoiceRecognition() }, 100L)
         } else {
-            // On subsequent resumes, decide what to do
             if (wasDetectingBeforePause) {
-                // If we were in any detection mode, call BOTH stop functions to ensure a clean reset.
                 stopDetection()
                 stopDeepSceneDiscovery()
-                wasDetectingBeforePause = false // Reset the flag for the next pause event
+                wasDetectingBeforePause = false
             } else {
-                // Otherwise, just start listening for commands
                 handler.postDelayed({ startVoiceRecognition() }, 100L)
             }
         }
@@ -419,10 +716,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onPause() {
         super.onPause()
-        // Keep track of the detection state
         wasDetectingBeforePause = shouldDetect || isDeepSceneDiscoveryActive
-
-        // Stop active processes but DON'T reset the logical state
         shouldDetect = false
         handler.removeCallbacks(detectionRunnable)
 
@@ -436,9 +730,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             isSpeaking = false
         }
     }
-
-
-
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
@@ -454,28 +745,33 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 override fun onDone(utteranceId: String?) {
                     isSpeaking = false
-
                     if (isDeepSceneDiscoveryActive) {
                         deepSceneDiscovery.onSpeechFinished()
                     }
-
                     if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) {
-                        startVoiceRecognition()
+                        handler.post { startVoiceRecognition() }
                     }
                 }
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     isSpeaking = false
-
                     if (isDeepSceneDiscoveryActive) {
                         deepSceneDiscovery.onSpeechFinished()
                     }
-
                     if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) {
-                        startVoiceRecognition()
+                        handler.post { startVoiceRecognition() }
                     }
                 }
             })
+
+            // --- ADD THIS LOGIC ---
+            // Now that TTS is ready, check if we need to perform the initial greeting.
+            if (isVoiceActive && !hasGreeted) {
+                speak("Hello, how can I help you?")
+                hasGreeted = true // Mark as greeted to prevent this from repeating.
+                runOnUiThread { positionTextView.text = "Voice activated, say 'doors', 'cars', 'chairs', 'deep scene discovery', or 'stop'" }
+            }
+
             if (initialOfflineWarningSent && !isInternetAvailable()) {
                 speak("No internet connection. Some features may not work.")
             }
@@ -484,7 +780,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             runOnUiThread { positionTextView.text = "TTS initialization failed" }
         }
     }
-
 
     private fun processVoiceCommand(command: String) {
         if (command.isBlank() || command.lowercase(Locale.getDefault()) in listOf(
@@ -499,7 +794,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
         when {
-            command.lowercase(Locale.getDefault()).contains("hello") || command.lowercase(Locale.getDefault()).contains("vai") -> {
+            command.lowercase(Locale.getDefault()).contains("hello") || command.lowercase(Locale.getDefault()).contains("vai") || command.lowercase(Locale.getDefault()).contains("hey") || command.lowercase(Locale.getDefault()).contains("vi") || command.lowercase(Locale.getDefault()).contains("hi") || command.lowercase(Locale.getDefault()).contains("voi") -> {
                 isVoiceActive = true
                 if (!hasGreeted) {
                     speak("Hello, how can I help you?")
@@ -507,22 +802,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 runOnUiThread { positionTextView.text = "Voice activated, say 'doors', 'cars', 'chairs', 'deep scene discovery', or 'stop'" }
             }
-            command.lowercase(Locale.getDefault()).contains("doors") && !isDeepSceneDiscoveryActive -> {
+            command.lowercase(Locale.getDefault()).contains("door") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectDoors) {
                     startDetection("door")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("cars") && !isDeepSceneDiscoveryActive -> {
+            command.lowercase(Locale.getDefault()).contains("car") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectCars) {
                     startDetection("car")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("chairs") && !isDeepSceneDiscoveryActive -> {
+            command.lowercase(Locale.getDefault()).contains("chair") && !isDeepSceneDiscoveryActive -> {
                 if (!shouldDetectChairs) {
                     startDetection("chair")
                 }
             }
-            command.lowercase(Locale.getDefault()).contains("deep") || command.lowercase(Locale.getDefault()).contains("scene") || command.lowercase(Locale.getDefault()).contains("discovery") -> {
+            command.lowercase(Locale.getDefault()).contains("deep") || command.lowercase(Locale.getDefault()).contains("scene") || command.lowercase(Locale.getDefault()).contains("discover") -> {
                 if (!isDeepSceneDiscoveryActive) {
                     startDeepSceneDiscovery()
                 }
@@ -539,10 +834,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun setupFullscreenUI() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.decorView.windowInsetsController?.let {
-                it.hide(android.view.WindowInsets.Type.statusBars())
-                it.systemBarsBehavior =
-                    android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             }
         } else {
             @Suppress("DEPRECATION")
@@ -684,114 +978,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-            this.cameraProvider = cameraProvider
-
-            val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                display?.rotation ?: Surface.ROTATION_0
-            } else {
-                @Suppress("DEPRECATION")
-                windowManager.defaultDisplay.rotation
-            }
-
-            preview = Preview.Builder()
-                .setTargetRotation(rotation)
-                .build()
-                .also { it.surfaceProvider = previewView.surfaceProvider }
-
-            analysis = ImageAnalysis.Builder()
-                .setTargetRotation(rotation)
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(640, 640),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                            )
-                        )
-                        .build()
-                )
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-                .also { it.setAnalyzer(cameraExecutor) { proxy -> onFrame(proxy) } }
-
-            try {
-                val cameraInfos = cameraProvider.availableCameraInfos
-                if (cameraInfos.isEmpty()) {
-                    Log.w(TAG, "No cameras available, using default back camera")
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        this,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis
-                    )
-                    return@addListener
-                }
-
-                val rearCameras = cameraInfos.filter { cameraInfo ->
-                    val lensFacing = cameraInfo.lensFacing
-                    lensFacing == CameraSelector.LENS_FACING_BACK
-                }
-
-                if (rearCameras.isEmpty()) {
-                    Log.w(TAG, "No rear-facing cameras found, using default back camera")
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        this,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis
-                    )
-                    return@addListener
-                }
-
-                var selectedCameraInfo = rearCameras[0]
-                var shortestFocalLength = Float.MAX_VALUE
-
-                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
-                for (cameraInfo in rearCameras) {
-                    val camera2Info = Camera2CameraInfo.from(cameraInfo)
-                    val cameraId = camera2Info.cameraId
-                    val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-                    val focalLengths = characteristics.get(android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                    if (focalLengths != null && focalLengths.isNotEmpty()) {
-                        val minFocalLength = focalLengths.minOrNull() ?: Float.MAX_VALUE
-                        if (minFocalLength < shortestFocalLength) {
-                            shortestFocalLength = minFocalLength
-                            selectedCameraInfo = cameraInfo
-                        }
-                    }
-                }
-
-                val cameraSelector = if (shortestFocalLength < Float.MAX_VALUE) {
-                    Log.d(TAG, "Selected camera with widest FOV (focal length: $shortestFocalLength mm)")
-                    CameraSelector.Builder()
-                        .addCameraFilter { list -> list.filter { it == selectedCameraInfo } }
-                        .build()
-                } else {
-                    Log.w(TAG, "No focal length data available, using default back camera")
-                    CameraSelector.DEFAULT_BACK_CAMERA
-                }
-
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this,
-                    cameraSelector,
-                    preview,
-                    analysis
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "Camera binding failed: ${e.message}", e)
-                runOnUiThread { positionTextView.text = "Camera binding failed: ${e.message}" }
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -828,12 +1014,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun triggerDetection() {
-        if (canProcess && shouldDetect) {
-            Log.d(TAG, "Triggered detection")
-        }
-    }
-
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
         if ((!shouldDetect && !isDeepSceneDiscoveryActive) || !canProcess || currentTime - lastDetectionTime < DETECTION_INTERVAL_MS) {
@@ -847,7 +1027,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val bmp = imageProxyToBitmap(image)
             image.close()
 
-            if (isDeepSceneDiscoveryActive && !deepSceneDiscovery.isProcessing())  {
+            if (isLowLight(bmp) && !isFlashOn) {
+                runOnUiThread {
+                    lowLightWarningTextView.visibility = View.VISIBLE
+                }
+            } else {
+                runOnUiThread {
+                    lowLightWarningTextView.visibility = View.GONE
+                }
+            }
+
+            if (isDeepSceneDiscoveryActive) {
                 deepSceneDiscovery.processFrame(bmp)
                 canProcess = true
                 return
@@ -856,6 +1046,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (isImageMostlyUniform(bmp)) {
                 val msg = "You are going to hit something."
                 handleMessage(msg)
+                triggerHapticFeedback()
                 canProcess = true
                 return
             }
@@ -981,7 +1172,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (consecutiveIdenticalCount == 1) {
             speak(message)
-            runOnUiThread { positionTextView.text = message }
+            // This block no longer hides the low-light warning
+            runOnUiThread {
+                positionTextView.visibility = View.VISIBLE
+                positionTextView.text = message
+            }
         }
     }
 
@@ -1136,12 +1331,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return abs(obstacleCenter - doorCenter) < pathWidth / 2
     }
 
-    private fun dilateArray(array: Array<FloatArray>, kernelSize: Int): Array<FloatArray> {
+    private fun dilateArray(array: Array<FloatArray>): Array<FloatArray> {
         val result = Array(array.size) { FloatArray(array[0].size) }
-        val radius = kernelSize / 2
+        val radius = 1 // Since kernelSize is always 3, radius is always 1
         for (y in array.indices) {
             for (x in array[0].indices) {
                 var value = 0f
+                // The loops now go from -1 to 1
                 for (ky in -radius..radius) {
                     for (kx in -radius..radius) {
                         val ny = y + ky
@@ -1159,12 +1355,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun startDetection(type: String? = null) {
         if (type == null) {
+            swipeInstructionTextView.visibility = View.VISIBLE
             isWaitingForIconSelection = true
             shouldDetect = false
-            shouldDetectDoors = false
-            shouldDetectCars = false
-            shouldDetectChairs = false
+            // Hide arrows when waiting for icon selection
             runOnUiThread {
+                leftArrowImageView.visibility = View.GONE
+                rightArrowImageView.visibility = View.GONE
                 detectButton.text = "Stop Detection"
                 chairButton.visibility = View.VISIBLE
                 carButton.visibility = View.VISIBLE
@@ -1173,6 +1370,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             speak("Starting detection, press on the icon that you want to detect")
         } else {
+            currentDetectionIndex = detectionModes.indexOf(type).coerceAtLeast(0)
+            swipeInstructionTextView.visibility = View.VISIBLE
             isWaitingForIconSelection = false
             shouldDetect = true
             shouldDetectDoors = type == "door"
@@ -1180,17 +1379,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             shouldDetectChairs = type == "chair"
             runOnUiThread {
                 detectButton.text = "Stop Detection"
+                // Show arrows now that a specific detection is active
+                leftArrowImageView.visibility = View.VISIBLE
+                rightArrowImageView.visibility = View.VISIBLE
                 chairButton.visibility = View.GONE
                 carButton.visibility = View.GONE
                 doorButton.visibility = View.GONE
-                positionTextView.text = "Starting $type detection"
+                positionTextView.text = "Detecting ${type}s"
             }
-            speak("Starting detecting ${type}s")
+            speak("Detecting ${type}s")
+            handler.removeCallbacks(detectionRunnable)
             handler.post(detectionRunnable)
         }
     }
 
     private fun stopDetection() {
+        swipeInstructionTextView.visibility = View.GONE
         shouldDetect = false
         shouldDetectDoors = false
         shouldDetectCars = false
@@ -1200,26 +1404,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         handler.removeCallbacks(detectionRunnable)
         runOnUiThread {
             detectButton.text = "Start Detection"
+            leftArrowImageView.visibility = View.GONE
+            rightArrowImageView.visibility = View.GONE
             chairButton.visibility = View.GONE
             carButton.visibility = View.GONE
             doorButton.visibility = View.GONE
             positionTextView.text = "Detection stopped"
         }
-        speak("Stopping detection")
     }
 
     private fun startDeepSceneDiscovery() {
+        swipeInstructionTextView.visibility = View.VISIBLE
         stopDetection()
         isDeepSceneDiscoveryActive = true
         runOnUiThread {
             detectButton.text = "Stop Detection"
             positionTextView.text = "Deep Scene Discovery active"
         }
-        speak("Starting Deep Scene Discovery")
         deepSceneDiscovery.start()
     }
 
     private fun stopDeepSceneDiscovery() {
+        swipeInstructionTextView.visibility = View.GONE
         isDeepSceneDiscoveryActive = false
         deepSceneDiscovery.stop()
         isVoiceActive = false
@@ -1439,7 +1645,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     dets += Triple(box, maskCoefs, className)
                 }
             }
-            val final = applyNMS(dets, 0.5f)
+            val final = applyNMS(dets, 0.6f)
             val obstacles = mutableListOf<Obstacle>()
             val protoH = protoShape[1]
             val protoW = protoShape[2]
@@ -1467,7 +1673,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         if ((shouldDetectCars && className == "car") || (shouldDetectChairs && className == "chair")) {
                             continue
                         }
-                        val dilatedMask = dilateArray(mask, 3)
+                        val dilatedMask = dilateArray(mask)
                         obstacles.add(Obstacle(box, dilatedMask, className))
                     }
                 } catch (e: Exception) {
@@ -1537,7 +1743,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     var activePixels = 0
                     for (dy in 0 until 256) {
                         for (dx in 0 until 256) {
-                            val py = (dy * protoH / 256).coerceIn(0, protoH - 1)
+                            val py = (dy * protoH / 256).coerceIn(0, protoH -
+
+                                    1)
                             val px = (dx * protoW / 256).coerceIn(0, protoW - 1)
                             var maskValue = 0f
                             for (c in 0 until minOf(coefs.size, protoC)) {
@@ -1551,7 +1759,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         }
                     }
                     if (activePixels >= 50) {
-                        val dilatedMask = dilateArray(mask, 3)
+                        val dilatedMask = dilateArray(mask)
                         obstacles.add(Obstacle(box, dilatedMask, className))
                     }
                 } catch (e: Exception) {
@@ -1635,7 +1843,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         }
                     }
                     if (activePixels >= 50) {
-                        val dilatedMask = dilateArray(mask, 3)
+                        val dilatedMask = dilateArray(mask)
                         obstacles.add(Obstacle(box, dilatedMask, className))
                     }
                 } catch (e: Exception) {
@@ -1736,11 +1944,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 1001) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-                startCamera()
-                startVoiceRecognition()
-                if (!isInternetAvailable()) {
-                    initialOfflineWarningSent = true
-                }
+                initializeComponents()
             } else {
                 val deniedPermissions = permissions.filterIndexed { index, _ ->
                     grantResults[index] != PackageManager.PERMISSION_GRANTED

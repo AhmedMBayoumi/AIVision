@@ -15,6 +15,8 @@ kotlinxCoroutinesAndroid = "1.8.1"
 material = "1.12.0"
 opencv = "4.9.0"
 opencvAndroid = "4.5.5"
+secretsGradlePlugin = "2.0.1"
+tasksVision = "0.20230731"
 tensorflowLite = "2.16.1"
 tensorflowLiteGpu = "2.16.1"
 tensorflowLiteGpuDelegatePlugin = "0.4.0"
@@ -33,6 +35,8 @@ core = { module = "com.google.ar:core", version.ref = "core" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutinesAndroid" }
 opencv = { module = "org.opencv:opencv", version.ref = "opencv" }
 opencv-android = { module = "org.opencv:opencv-android", version.ref = "opencvAndroid" }
+secrets-gradle-plugin = { module = "com.google.android.libraries.mapsplatform.secrets-gradle-plugin:secrets-gradle-plugin", version.ref = "secretsGradlePlugin" }
+tasks-vision = { module = "com.google.mediapipe:tasks-vision", version.ref = "tasksVision" }
 tensorflow-lite-gpu-api = { module = "org.tensorflow:tensorflow-lite-gpu-api", version = "2.16.1" }
 androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "cameraCore" }
 androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "cameraCore" }

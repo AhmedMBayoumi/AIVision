@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    id("com.google.android.libraries.mapsplatform.secrets-gradle-plugin")
 }
 
 android {
@@ -49,6 +50,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation(libs.secrets.gradle.plugin)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.firebase.crashlytics.buildtools)
