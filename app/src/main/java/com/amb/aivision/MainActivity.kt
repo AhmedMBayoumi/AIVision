@@ -159,6 +159,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var activeCameraSelector: CameraSelector? = null
     private var isFlashOn = false
     private var isSwitchingCamera = false // Flag to prevent rapid switching
+    private var lastDetectionMode: String? = null
 
 
 
@@ -339,6 +340,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         camera?.cameraControl?.enableTorch(true)
                     } else {
                         animateAndSwitchCamera(targetSelector, turnFlashOn = true)
+                    }
+                    // Restore the previous detection mode if available
+                    lastDetectionMode?.let { mode ->
+                        when (mode) {
+                            "deep_scene" -> startDeepSceneDiscovery()
+                            "door", "chair", "car" -> startDetection(mode)
+                        }
                     }
                 } else {
                     val targetSelector = ultraWideCameraSelector
@@ -1030,7 +1038,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (isLowLight(bmp) && !isFlashOn) {
                 runOnUiThread {
                     lowLightWarningTextView.visibility = View.VISIBLE
+                    positionTextView.isSingleLine = false
+                    positionTextView.maxLines = 3
+                    positionTextView.text = "Low lighting. Double tap to turn the flash on"
+                    Log.d(TAG, "Low light message set: Low lighting. Double tap to turn the flash on")
                 }
+                if (shouldDetect || isDeepSceneDiscoveryActive) {
+                    lastDetectionMode = when {
+                        isDeepSceneDiscoveryActive -> "deep_scene"
+                        shouldDetectDoors -> "door"
+                        shouldDetectChairs -> "chair"
+                        shouldDetectCars -> "car"
+                        else -> null
+                    }
+                    stopDetection()
+                    stopDeepSceneDiscovery()
+                    speak("Low lighting. Double tap to turn the flash on")
+                }
+                canProcess = true
+                return
             } else {
                 runOnUiThread {
                     lowLightWarningTextView.visibility = View.GONE
@@ -1131,7 +1157,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
-            runOnUiThread { positionTextView.text = "Error: ${e.message}" }
+            runOnUiThread {
+                positionTextView.isSingleLine = false
+                positionTextView.maxLines = 3
+                positionTextView.text = "Error: ${e.message}"
+                Log.d(TAG, "Error message set: Error: ${e.message}")
+            }
         } finally {
             canProcess = true
         }
@@ -1172,10 +1203,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (consecutiveIdenticalCount == 1) {
             speak(message)
-            // This block no longer hides the low-light warning
             runOnUiThread {
                 positionTextView.visibility = View.VISIBLE
+                positionTextView.isSingleLine = false
+                positionTextView.maxLines = 3
                 positionTextView.text = message
+                Log.d(TAG, "Message set: $message")
             }
         }
     }
