@@ -76,8 +76,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     companion object {
         private const val PROCESSING_SIZE = 256         // for seg & depth
-        private const val PROXIMITY_THRESHOLD_M = 0.5f  // 0.75 meters for obstacles
-        private const val PROXIMITY_THRESHOLD_D = 0.1f // Close to door
+        private const val PROXIMITY_THRESHOLD_M = 0.2f
+        private const val PROXIMITY_THRESHOLD_D = 0.4f
         private const val DETECTION_RESOLUTION = 640   // For door detection
         private const val DEPTH_SCALE_FACTOR = 100.0f   // For MiDaS depth to meters
         private const val DETECTION_INTERVAL_MS = 333L
@@ -159,6 +159,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var activeCameraSelector: CameraSelector? = null
     private var isFlashOn = false
     private var isSwitchingCamera = false // Flag to prevent rapid switching
+    private var lastDetectionMode: String? = null
 
 
 
@@ -241,7 +242,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             true
         }
 
-        // --- MODIFICATION: Check if launched as an assistant ---
         if (intent?.action == Intent.ACTION_ASSIST) {
             isVoiceActive = true
         }
@@ -339,6 +339,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         camera?.cameraControl?.enableTorch(true)
                     } else {
                         animateAndSwitchCamera(targetSelector, turnFlashOn = true)
+                    }
+                    // Restore the previous detection mode if available
+                    lastDetectionMode?.let { mode ->
+                        when (mode) {
+                            "deep_scene" -> startDeepSceneDiscovery()
+                            "door", "chair", "car" -> startDetection(mode)
+                        }
                     }
                 } else {
                     val targetSelector = ultraWideCameraSelector
@@ -1030,7 +1037,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             if (isLowLight(bmp) && !isFlashOn) {
                 runOnUiThread {
                     lowLightWarningTextView.visibility = View.VISIBLE
+                    positionTextView.isSingleLine = false
+                    positionTextView.maxLines = 3
+                    positionTextView.text = "Low lighting. Double tap to turn the flash on"
+                    Log.d(TAG, "Low light message set: Low lighting. Double tap to turn the flash on")
                 }
+                if (shouldDetect || isDeepSceneDiscoveryActive) {
+                    lastDetectionMode = when {
+                        isDeepSceneDiscoveryActive -> "deep_scene"
+                        shouldDetectDoors -> "door"
+                        shouldDetectChairs -> "chair"
+                        shouldDetectCars -> "car"
+                        else -> null
+                    }
+                    stopDetection()
+                    stopDeepSceneDiscovery()
+                    speak("Low lighting. Double tap to turn the flash on")
+                }
+                canProcess = true
+                return
             } else {
                 runOnUiThread {
                     lowLightWarningTextView.visibility = View.GONE
@@ -1131,7 +1156,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
-            runOnUiThread { positionTextView.text = "Error: ${e.message}" }
+            runOnUiThread {
+                positionTextView.isSingleLine = false
+                positionTextView.maxLines = 3
+                positionTextView.text = "Error: ${e.message}"
+                Log.d(TAG, "Error message set: Error: ${e.message}")
+            }
         } finally {
             canProcess = true
         }
@@ -1172,10 +1202,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         if (consecutiveIdenticalCount == 1) {
             speak(message)
-            // This block no longer hides the low-light warning
             runOnUiThread {
                 positionTextView.visibility = View.VISIBLE
+                positionTextView.isSingleLine = false
+                positionTextView.maxLines = 3
                 positionTextView.text = message
+                Log.d(TAG, "Message set: $message")
             }
         }
     }
@@ -1312,7 +1344,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             for (x in 0 until depthW) {
                 val maskY = (y * mask.size / depthH).coerceIn(0, mask.size - 1)
                 val maskX = (x * mask[0].size / depthW).coerceIn(0, mask[0].size - 1)
-                if (mask[maskY][maskX] > 0.1f) {
+                if (mask[maskY][maskX] > 0.01f) {
                     val depthValue = depthMap[y][x]
                     if (!depthValue.isNaN() && depthValue.isFinite()) {
                         sum += depthValue
@@ -1444,7 +1476,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         inputBuffer.rewind()
         val outputs = Array(1) { Array(5) { FloatArray(8400) } }
         tflite.run(inputBuffer, outputs)
-        val threshold = 0.75f
+        val threshold = 0.5f
         val iouThresh = 0.6f
         val detections = mutableListOf<Triple<RectF, Float, String>>()
 
@@ -1617,7 +1649,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.75f
+            val threshold = 0.5f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1663,7 +1695,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.1f) {
+                            if (maskValue > 0.01f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
                             }
@@ -1699,7 +1731,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.75f
+            val threshold = 0.5f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1752,7 +1784,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.1f) {
+                            if (maskValue > 0.01f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
                             }
@@ -1785,7 +1817,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
             val raw = detOut[0]
             val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.75f
+            val threshold = 0.5f
             val numClasses = 80
             val maskCoefsCount = detShape[1] - 4 - numClasses
             val maskCoefsStartIdx = 4 + numClasses
@@ -1836,7 +1868,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                                 maskValue += coefs[c] * protoOut[0][py][px][c]
                             }
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.1f) {
+                            if (maskValue > 0.01f) {
                                 mask[dy][dx] = 1f
                                 activePixels++
                             }
@@ -1934,7 +1966,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             variance += diff * diff
         }
         variance /= pixels.size
-        val varianceThreshold = 1000f
+        val varianceThreshold = 2500f
         return variance < varianceThreshold
     }
 
