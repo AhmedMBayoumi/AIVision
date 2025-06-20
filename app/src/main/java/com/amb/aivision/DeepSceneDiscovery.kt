@@ -28,6 +28,7 @@ class DeepSceneDiscovery(private val context: Context) {
 
     init {
         try {
+            // Final Model
             val modelName = "gemini-2.5-flash-preview-05-20"
             val apiKey = BuildConfig.GEMINI_API_KEY
             val generationConfig = generationConfig {
@@ -95,7 +96,7 @@ class DeepSceneDiscovery(private val context: Context) {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val prompt = "briefly describe the scene in front of the camera. if you see a paper say that there is a paper and try to read what is in it and if you can not read just say there is a paper with contents that is not clear. Additionally, if you see a door, car or a chair explain the path i should take to reach the it and how to avoid anything i can bump into. if there is no object from what i talked about then do not say anything about them and only describe the scene. do not use any introduction or ending just generate what i asked for."
+                val prompt = "very briefly describe the scene in front of the camera (1 or 2 sentences). if you see a paper or a sign or anything with writing in it, say that there is a something written and try to read what is in it and if you can not read just say there is a paper or sign with contents that is not clear. Additionally, if you see a door, car or a chair explain the path i should take to reach the it and how to avoid anything i can bump into. if there is no object from what i talked about then do not say anything about them and only describe the scene. do not use any introduction or ending just generate what i asked for."
 
                 val inputContent = content {
                     image(bitmap)
@@ -115,7 +116,7 @@ class DeepSceneDiscovery(private val context: Context) {
                     Log.e(TAG, "Gemini response was null.")
                     context.runOnUiThread {
                         context.speak("I could not analyze the scene.")
-                        context.positionTextView.text = "Error: Null response from API."
+//                        context.positionTextView.text = "Error: Null response from API."
                     }
                     onSpeechFinished()
                 }
@@ -123,7 +124,7 @@ class DeepSceneDiscovery(private val context: Context) {
             } catch (e: Exception) {
                 Log.e(TAG, "Error calling Gemini API: ${e.message}", e)
                 context.runOnUiThread {
-                    context.positionTextView.text = "Error: ${e.message}"
+//                    context.positionTextView.text = "Error: ${e.message}"
                     context.speak("There was an error.")
                 }
                 onSpeechFinished()
