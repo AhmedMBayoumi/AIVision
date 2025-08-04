@@ -2,7 +2,7 @@
 
 ![AI Vision Assistant Logo](https://placehold.co/600x300/1e293b/ffffff?text=AI+Vision+Assistant)
 
-**AI Vision Assistant** is a powerful Android application designed to aid visually impaired individuals by leveraging state-of-the-art machine learning models. It transforms a standard smartphone camera into an intelligent eye, providing real-time auditory feedback about the user's surroundings. The app combines on-device object detection, advanced depth estimation, and scene description powered by the Gemma 3B model to create a rich, interactive, and navigable experience.
+**AI Vision Assistant** is a powerful Android application designed to aid visually impaired individuals by leveraging state-of-the-art machine learning models. It transforms a standard smartphone camera into an intelligent eye, providing real-time auditory feedback about the user's surroundings. The app combines on-device object detection, advanced depth estimation, and scene description powered by the **Gemma 3n** model to create a rich, interactive, and navigable experience.
 
 The entire user interface is driven by intuitive gestures and voice commands, ensuring full accessibility without needing to see the screen.
 
