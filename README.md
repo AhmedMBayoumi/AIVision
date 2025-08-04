@@ -72,9 +72,9 @@ To get this project running on your own device, follow these steps:
     ```
 
 2.  **Download and Configure Gemma 3n 4B Model:**
-    * Download the pre-trained Gemma 3n 4B model from a trusted source (e.g., Hugging Face or the official model repository).
-    * Place the model file in the app/src/main/assets/ directory of the Android project.
-    * Ensure the model is optimized for TensorFlow Lite to run efficiently on mobile devices. Refer to the TensorFlow Lite documentation for model conversion instructions if needed.
+    * Open the app on your Android device after installation.
+    * Press the "Download Model" button in the app's settings or initial setup screen.
+    * Wait for the Gemma 3B model to download and load. Once complete, the app will notify you that the model is ready to use.
 
 3.  **Open in Android Studio:**
     * Open Android Studio and select "Open an existing project."
