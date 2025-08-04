@@ -66,7 +66,6 @@ private const val TAG = "MainActivity"
 
 @SuppressLint("SetTextI18n")
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
-
     companion object {
         private const val PROXIMITY_THRESHOLD_M = 0.2f
         private const val PROXIMITY_THRESHOLD_D = 0.4f
@@ -76,7 +75,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val MODEL_FILE_NAME = "gemma-3n-E4B-it-int4.task"
         private const val MODEL_URL_HF = "https://huggingface.co/google/gemma-3n-E4B-it-litert-preview/resolve/main/gemma-3n-E4B-it-int4.task?download=true"
         private const val MODEL_URL_KAGGLE = "https://www.kaggle.com/models/google/gemma-3n/tfLite/download?file=gemma-3n-E4B-it-int4.task.zip"
-        private const val HF_TOKEN = "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"
+        private const val HF = BuildConfig.HF_TOKEN
         private const val REQUEST_PERMISSIONS_CODE = 1001
 //        private const val MODEL_TOTAL_BYTES = 4_733_321_216L // 4.41 GB for Hugging Face
         private const val MODEL_TOTAL_BYTES = 4_402_141_478L // 4.10 GB for Hugging Face
@@ -197,7 +196,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             totalBytes = MODEL_TOTAL_BYTES,
             downloadFileName = MODEL_FILE_NAME,
             normalizedName = modelDIR,
-            accessToken = HF_TOKEN
+            accessToken = HF
         )
 
         // Initialize Gemma model immediately on app start

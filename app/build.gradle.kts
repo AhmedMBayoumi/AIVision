@@ -1,4 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
+import java.io.FileInputStream
 
 plugins {
     alias(libs.plugins.android.application)
@@ -21,6 +23,8 @@ android {
         versionCode = 2
         versionName = "2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Make the API token available in BuildConfig
+        buildConfigField("String", "HF_TOKEN", "\"${project.findProperty("HF_TOKEN") ?: ""}\"")
     }
 
     buildTypes {
