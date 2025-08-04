@@ -53,10 +53,10 @@ This project integrates a powerful set of modern Android and Machine Learning te
     * [TensorFlow Lite](https://www.tensorflow.org/lite) for running models on the device.
     * **YOLOv8 & YOLOv11-seg:** State-of-the-art models for object detection and instance segmentation.
     * **MiDaS:** A powerful model for monocular depth estimation.
-    * ""Gemma 3n**: A lightweight, on-device generative AI model for advanced image-to-text descriptions.
+    * **Gemma 3n**: A lightweight, on-device generative AI model for advanced image-to-text descriptions.
 * **Image Processing:** [OpenCV for Android](https://opencv.org/android/) for classical computer vision tasks like door confirmation and image manipulations.
 * **UI & Asynchronous Tasks:**
-    * [Coroutines](https://kotlinlang.org/docs/coroutines-overview.html) for managing background tasks and API calls without blocking the main thread.
+    * [Coroutines](https://kotlinlang.org/docs/coroutines-overview.html) for managing background tasks without blocking the main thread.
     * Android UI Toolkit for views and animations.
 * **Accessibility:** Android Text-to-Speech (TTS) and Vibrator services.
 
