@@ -4,71 +4,90 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
-import com.google.ai.client.generativeai.GenerativeModel
-import com.google.ai.client.generativeai.type.generationConfig
-import com.google.ai.client.generativeai.type.content
+import android.view.View
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.genai.llminference.GraphOptions
+import com.google.mediapipe.tasks.genai.llminference.LlmInference
+import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.lang.IllegalStateException
 
 @SuppressLint("SetTextI18n")
 class DeepSceneDiscovery(private val context: Context) {
 
     companion object {
         private const val TAG = "DeepSceneDiscovery"
+        private const val MODEL_PATH = "models/gemma-3n-E4B-it-int4.task"
     }
+
+    private var llmInference: LlmInference? = null
+    private var isInitialized = false
+    var initializationComplete = false
+    private lateinit var mainActivity: MainActivity
 
     @Volatile
     private var isProcessing = false
-
     @Volatile
     private var readyToProcess = false
 
-    private lateinit var generativeModel: GenerativeModel
+    private val inferenceLock = Any()
 
-    init {
-        try {
-            // Final Model
-            val modelName = "gemini-2.5-flash-preview-05-20"
-            val apiKey = BuildConfig.GEMINI_API_KEY
-            val generationConfig = generationConfig {
-                temperature = 0.4f
-                topK = 32
-                topP = 1.0f
-                maxOutputTokens = 8192
+    suspend fun initialize() {
+        if (isInitialized) {
+            initializationComplete = true
+            return
+        }
+
+        withContext(Dispatchers.IO) {
+            try {
+                val modelFile = File(context.getExternalFilesDir(null), MODEL_PATH)
+                if (!modelFile.exists()) {
+                    throw IllegalStateException("Model file not found: ${modelFile.absolutePath}")
+                }
+
+                val inferenceOptions = LlmInference.LlmInferenceOptions.builder()
+                    .setModelPath(modelFile.absolutePath)
+                    .setPreferredBackend(LlmInference.Backend.GPU)
+                    .setMaxNumImages(1)
+                    .setMaxTokens(1024)
+                    .build()
+                llmInference = LlmInference.createFromOptions(context, inferenceOptions)
+
+                isInitialized = true
+                initializationComplete = true
+                Log.d(TAG, "LlmInference engine loaded successfully")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize model: ${e.message}", e)
+                initializationComplete = false
+                throw e
             }
-
-            generativeModel = GenerativeModel(
-                modelName = modelName,
-                apiKey = apiKey,
-                generationConfig = generationConfig
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize GenerativeModel", e)
         }
     }
 
     fun start() {
+        if (!initializationComplete) {
+            mainActivity.speak("Model is not ready yet")
+            return
+        }
         isProcessing = false
         readyToProcess = false
-        Log.d(TAG, "Deep Scene Discovery started")
-
-        (context as MainActivity).runOnUiThread {
-            context.swipeInstructionTextView.text = "Swipe Down to Stop Detecting"
-            context.swipeInstructionTextView.visibility = android.view.View.VISIBLE
-            Log.d(TAG, "Set swipeInstructionTextView to VISIBLE")
+        mainActivity.runOnUiThread {
+            mainActivity.swipeInstructionTextView.text = "Swipe Down to Stop Detecting"
+            mainActivity.swipeInstructionTextView.visibility = View.VISIBLE
         }
-        context.speak("Starting Deep Scene Discovery")
+        mainActivity.speak("Starting Deep Scene Discovery")
     }
 
     fun stop() {
         isProcessing = false
         readyToProcess = false
-        Log.d(TAG, "Deep Scene Discovery stopped")
-
-        (context as MainActivity).runOnUiThread {
-            context.swipeInstructionTextView.visibility = android.view.View.GONE
-            Log.d(TAG, "Set swipeInstructionTextView to GONE")
+        mainActivity.runOnUiThread {
+            mainActivity.swipeInstructionTextView.visibility = View.GONE
         }
     }
 
@@ -76,59 +95,73 @@ class DeepSceneDiscovery(private val context: Context) {
         isProcessing = false
         if (!readyToProcess) {
             readyToProcess = true
-            Log.d(TAG, "Startup announcement finished. Ready to process frames.")
         }
-        Log.d(TAG, "Speech finished. Ready for next frame.")
     }
 
     fun processFrame(bitmap: Bitmap) {
-        if (isProcessing || !readyToProcess) {
-            Log.d(TAG, "Skipping frame processing: isProcessing=$isProcessing, readyToProcess=$readyToProcess")
+        if (!initializationComplete || isProcessing || !readyToProcess || llmInference == null) {
             return
         }
 
         isProcessing = true
-        Log.d(TAG, "Processing new frame...")
-
-        (context as MainActivity).runOnUiThread {
-            context.positionTextView.text = "Analyzing scene..."
+        mainActivity.runOnUiThread {
+            mainActivity.positionTextView.text = ""
         }
 
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val prompt = "very briefly describe the scene in front of the camera (1 or 2 sentences). if you see a paper or a sign or anything with writing in it, say that there is a something written and try to read what is in it and if you can not read just say there is a paper or sign with contents that is not clear. Additionally, if you see a door, car or a chair explain the path i should take to reach the it and how to avoid anything i can bump into. if there is no object from what i talked about then do not say anything about them and only describe the scene. do not use any introduction or ending just generate what i asked for."
+        CoroutineScope(Dispatchers.Default).launch {
+            var newSession: LlmInferenceSession? = null
+            synchronized(inferenceLock) {
+                try {
+                    val sessionOptions = LlmInferenceSession.LlmInferenceSessionOptions.builder()
+                        .setTopK(40)
+                        .setTemperature(1.0f)
+                        .setGraphOptions(
+                            GraphOptions.builder()
+                                .setEnableVisionModality(true)
+                                .build()
+                        )
+                        .build()
+                    newSession = LlmInferenceSession.createFromOptions(llmInference!!, sessionOptions)
 
-                val inputContent = content {
-                    image(bitmap)
-                    text(prompt)
-                }
+                    val prompt = "You are a concise AI assistant for the visually impaired. Your response must be direct and follow these rules precisely, in this exact order. Generate only the information requested.\n" +
+                            "\n" +
+                            "1.  **Scene Description:** Provide a single, brief sentence describing the overall scene.\n" +
+                            "\n" +
+                            "2.  **Text Recognition:** Identify and quote any visible text from physical objects like signs and papers, or from digital screens. If text is present but unreadable, state \"Unclear text is visible.\"\n" +
+                            "\n" +
+                            "3.  **Navigation Path (Strict Rule):**\n" +
+                            "    * **ONLY** if a **door**, **car**, or **chair** is clearly visible, describe the path to it and mention any obstacles.\n" +
+                            "    * Do **NOT** describe a path to any other object.\n" +
+                            "    * If none of these three specific objects are visible, omit this section from your response entirely." +
+                            "Provide a single cohesive paragraph, do not reply with multiple disjoint points or sentences and do not announce the title of each point like (Scene Description, Text Recognition and Navigation Path). Finally, if there is no path or text then just skip it's point."
 
-                val response = generativeModel.generateContent(inputContent)
+                    newSession.addQueryChunk(prompt)
+                    newSession.addImage(BitmapImageBuilder(bitmap).build())
 
-                response.text?.let {
-                    if (!isProcessing) return@let
-                    Log.d(TAG, "Gemini Response: $it")
-                    context.runOnUiThread {
-                        context.speak(it)
-                        context.positionTextView.text = it
-                    }
-                } ?: run {
-                    Log.e(TAG, "Gemini response was null.")
-                    context.runOnUiThread {
-                        context.speak("I could not analyze the scene.")
-//                        context.positionTextView.text = "Error: Null response from API."
+                    val result = newSession.generateResponse()
+
+                    mainActivity.runOnUiThread {
+                        mainActivity.positionTextView.text = result
+                        if (result != null) {
+                            mainActivity.speak(result)
+                        }
                     }
                     onSpeechFinished()
-                }
 
-            } catch (e: Exception) {
-                Log.e(TAG, "Error calling Gemini API: ${e.message}", e)
-                context.runOnUiThread {
-//                    context.positionTextView.text = "Error: ${e.message}"
-                    context.speak("There was an error.")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during inference", e)
+                    mainActivity.runOnUiThread {
+                        mainActivity.speak("There was an error during analysis.")
+                    }
+                    onSpeechFinished()
+                } finally {
+                    newSession?.close()
                 }
-                onSpeechFinished()
             }
         }
+    }
+
+    fun setMainActivity(activity: MainActivity) {
+        this.mainActivity = activity
     }
 }

@@ -5,6 +5,8 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.view.animation.Animation
+import android.view.animation.AnimationUtils
 import android.content.pm.PackageManager
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -15,10 +17,11 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.os.Build
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -46,7 +49,15 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.createBitmap
 import androidx.core.view.WindowCompat
+import androidx.work.Data
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.opencv.android.OpenCVLoader
+import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -62,51 +73,60 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val DETECTION_INTERVAL_MS = 333L
         private const val ANIMATION_DURATION = 200L
         private const val DEPTH_SCALE_FACTOR = 100.0f
+        private const val MODEL_FILE_NAME = "gemma-3n-E4B-it-int4.task"
+        private const val MODEL_URL_HF = "https://huggingface.co/google/gemma-3n-E4B-it-litert-preview/resolve/main/gemma-3n-E4B-it-int4.task?download=true"
+        private const val MODEL_URL_KAGGLE = "https://www.kaggle.com/models/google/gemma-3n/tfLite/download?file=gemma-3n-E4B-it-int4.task.zip"
+        private const val HF_TOKEN = "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"
+        private const val REQUEST_PERMISSIONS_CODE = 1001
+//        private const val MODEL_TOTAL_BYTES = 4_733_321_216L // 4.41 GB for Hugging Face
+        private const val MODEL_TOTAL_BYTES = 4_402_141_478L // 4.10 GB for Hugging Face
+        private const val MODEL_TOTAL_BYTES_KAGGLE = 2_684_354_560L // ~2.5 GB for Kaggle ZIP
     }
 
     private val detectionModes = listOf("door", "chair", "car")
     private var currentDetectionIndex = 0
 
+    private val topLeftGlow: ImageView by lazy { findViewById(R.id.topLeftGlow) }
+    private val topRightGlow: ImageView by lazy { findViewById(R.id.topRightGlow) }
+    private val bottomLeftGlow: ImageView by lazy { findViewById(R.id.bottomLeftGlow) }
+    private val bottomRightGlow: ImageView by lazy { findViewById(R.id.bottomRightGlow) }
+    private lateinit var glowViews: List<ImageView>
     private val previewView: PreviewView by lazy { findViewById(R.id.previewView) }
     val positionTextView: TextView by lazy { findViewById(R.id.positionTextView) }
-    private val detectButton: Button by lazy { findViewById(R.id.detectButton) }
+    val detectButton: Button by lazy { findViewById(R.id.detectButton) }
     private val cameraSwitchOverlay: View by lazy { findViewById(R.id.cameraSwitchOverlay) }
     internal val swipeInstructionTextView: TextView by lazy { findViewById(R.id.swipeInstructionTextView) }
     private val chairButton: ImageButton by lazy { findViewById(R.id.chairButton) }
     private val carButton: ImageButton by lazy { findViewById(R.id.carButton) }
     private val doorButton: ImageButton by lazy { findViewById(R.id.doorButton) }
     private val lowLightWarningTextView: TextView by lazy { findViewById(R.id.lowLightWarningTextView) }
-
     private val leftArrowImageView: ImageView by lazy { findViewById(R.id.leftArrowImageView) }
     private val rightArrowImageView: ImageView by lazy { findViewById(R.id.rightArrowImageView) }
+    val downloadModelButton: Button by lazy { findViewById(R.id.downloadModelButton) }
     private lateinit var speechRecognizer: SpeechRecognizer
     private lateinit var gestureDetector: GestureDetector
     private lateinit var tts: TextToSpeech
-
+    private lateinit var model: Model
     private var lastDetectionTime = 0L
     private var isSpeaking = false
     private var isVoiceActive = false
     private var isRecognizerListening = false
     private var previousMessage: String? = null
     private var consecutiveIdenticalCount = 0
-
     var shouldDetectDoors = false
     var shouldDetectCars = false
     var shouldDetectChairs = false
     var shouldDetect = shouldDetectDoors || shouldDetectCars || shouldDetectChairs
     private var isDeepSceneDiscoveryActive = false
-
     private var canProcess = true
     var useYolo12s = false
     private var isFirstLaunch = true
-
-    private lateinit var cameraExecutor: ExecutorService
     private var initialOfflineWarningSent = false
     private var hasGreeted = false
     private var hasSpokenOfflineWarning = false
     private var hasSpokenDoorWarning = false
     private var wasDetectingBeforePause = false
-
+    private lateinit var cameraExecutor: ExecutorService
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: androidx.camera.core.Camera? = null
     private var mainCameraSelector: CameraSelector? = null
@@ -115,9 +135,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var isFlashOn = false
     private var isSwitchingCamera = false
     private var lastDetectionMode: String? = null
-
+    private val modelDIR = "models"
     private lateinit var deepSceneDiscovery: DeepSceneDiscovery
-
     private val handler = Handler(Looper.getMainLooper())
     private val detectionRunnable = object : Runnable {
         override fun run() {
@@ -126,10 +145,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         }
     }
-
     private var preview: Preview? = null
     private var analysis: ImageAnalysis? = null
-
     private lateinit var detectionLogic: DetectionLogic
 
     @SuppressLint("MissingPermission")
@@ -143,7 +160,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private var isWaitingForIconSelection = false
 
-    @SuppressLint("ClickableViewAccessibility")
+    @SuppressLint("ClickableViewAccessibility", "NewApi")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (OpenCVLoader.initLocal()) {
@@ -154,16 +171,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         setContentView(R.layout.activity_main)
         previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+        glowViews = listOf(topLeftGlow, topRightGlow, bottomLeftGlow, bottomRightGlow)
 
         window.decorView.setOnApplyWindowInsetsListener { _, insets ->
-            val topInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val topInset =
                 insets.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()).top
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                @Suppress("DEPRECATION")
-                insets.displayCutout?.safeInsetTop ?: insets.systemWindowInsetTop
-            } else {
-                (24 * resources.displayMetrics.density).toInt()
-            }
             (swipeInstructionTextView.layoutParams as ConstraintLayout.LayoutParams).apply {
                 topMargin = topInset + (8 * resources.displayMetrics.density).toInt()
             }
@@ -178,8 +190,39 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         deepSceneDiscovery = DeepSceneDiscovery(this)
-        detectionLogic = DetectionLogic(this)
+        deepSceneDiscovery.setMainActivity(this)
+        model = Model(
+            name = "gemma-3n",
+            url = MODEL_URL_HF,
+            totalBytes = MODEL_TOTAL_BYTES,
+            downloadFileName = MODEL_FILE_NAME,
+            normalizedName = modelDIR,
+            accessToken = HF_TOKEN
+        )
 
+        // Initialize Gemma model immediately on app start
+        CoroutineScope(Dispatchers.Main).launch {
+            deepSceneDiscovery.initialize()
+        }
+
+        checkModelAvailability()
+
+        downloadModelButton.setOnClickListener {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                positionTextView.text = "Camera permission required to proceed."
+                Toast.makeText(this, "Please grant camera permission.", Toast.LENGTH_LONG).show()
+                requestPermissions()
+            } else if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                positionTextView.text = "Notification permission required for download updates."
+                Toast.makeText(this, "Please grant notification permission.", Toast.LENGTH_LONG).show()
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_PERMISSIONS_CODE)
+            } else {
+                downloadModelButton.isEnabled = false
+                positionTextView.text = "Starting model download..."
+                startModelDownload()
+            }
+        }
+        detectionLogic = DetectionLogic(this)
         setupGestureDetector()
 
         previewView.setOnTouchListener { _, event ->
@@ -203,16 +246,121 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         requestPermissions()
     }
 
-    private fun requestPermissions() {
-        val permissionsToRequest = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-            permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    private fun checkModelAvailability(): Boolean {
+        val modelFile = File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME")
+        val expectedSize = MODEL_TOTAL_BYTES
+        if (modelFile.exists() && modelFile.length() >= expectedSize) {
+            runOnUiThread {
+                downloadModelButton.visibility = View.GONE
+                detectButton.isEnabled = true
+                positionTextView.text = "Model already downloaded."
+            }
+            return true
+        } else if (modelFile.exists() && modelFile.length() < expectedSize) {
+            runOnUiThread {
+                downloadModelButton.visibility = View.VISIBLE
+                detectButton.isEnabled = false
+                positionTextView.text = "Partial model detected. Please resume download."
+            }
+            checkExistingDownloads()
+            return false
+        } else {
+            runOnUiThread {
+                downloadModelButton.visibility = View.VISIBLE
+                detectButton.isEnabled = false
+                positionTextView.text = "Please download the model to start detection."
+            }
+            checkExistingDownloads()
+            return false
         }
-        val permissionsNeeded = permissionsToRequest.filter {
+    }
+
+    @SuppressLint("NewApi")
+    private fun startModelDownload() {
+        val workManager = WorkManager.getInstance(this)
+        val isKaggle = model.url == MODEL_URL_KAGGLE
+        val data = Data.Builder()
+            .putString(DownloadWorker.KEY_MODEL_URL, model.url)
+            .putString(DownloadWorker.KEY_MODEL_NAME, model.name)
+            .putString(DownloadWorker.KEY_MODEL_VERSION, "1.0")
+            .putString(DownloadWorker.KEY_MODEL_DOWNLOAD_FILE_NAME, if (isKaggle) "gemma-3n-E4B-it-int4.task.zip" else MODEL_FILE_NAME)
+            .putString(DownloadWorker.KEY_MODEL_DOWNLOAD_MODEL_DIR, modelDIR)
+            .putBoolean(DownloadWorker.KEY_MODEL_IS_ZIP, isKaggle)
+            .putString(DownloadWorker.KEY_MODEL_UNZIPPED_DIR, if (isKaggle) modelDIR else null)
+            .putLong(DownloadWorker.KEY_MODEL_TOTAL_BYTES, if (isKaggle) MODEL_TOTAL_BYTES_KAGGLE else MODEL_TOTAL_BYTES)
+            .putString(DownloadWorker.KEY_MODEL_DOWNLOAD_ACCESS_TOKEN, model.accessToken)
+            .build()
+
+        val downloadRequest = OneTimeWorkRequestBuilder<DownloadWorker>()
+            .setInputData(data)
+            .addTag(model.name)
+            .build()
+
+        workManager.enqueue(downloadRequest)
+        observeDownloadProgress(downloadRequest.id)
+    }
+
+    private fun checkExistingDownloads() {
+        val workManager = WorkManager.getInstance(this)
+        workManager.getWorkInfosByTagLiveData(model.name).observe(this) { workInfos ->
+            val workInfo = workInfos.find { it.tags.contains(model.name) }
+            if (workInfo != null && (workInfo.state == WorkInfo.State.ENQUEUED || workInfo.state == WorkInfo.State.RUNNING)) {
+                downloadModelButton.isEnabled = false
+                positionTextView.text = "Download already in progress..."
+                observeDownloadProgress(workInfo.id)
+            }
+        }
+    }
+
+    @SuppressLint("NewApi")
+    private fun observeDownloadProgress(workId: UUID) {
+        WorkManager.getInstance(this).getWorkInfoByIdLiveData(workId).observe(this) { workInfo ->
+            if (workInfo != null) {
+                when (workInfo.state) {
+                    WorkInfo.State.RUNNING -> {
+                        val receivedBytes = workInfo.progress.getLong(DownloadWorker.KEY_MODEL_DOWNLOAD_RECEIVED_BYTES, 0L)
+                        val isUnzipping = workInfo.progress.getBoolean(DownloadWorker.KEY_MODEL_START_UNZIPPING, false)
+                        val progress = minOf((receivedBytes * 100.0 / MODEL_TOTAL_BYTES.toDouble()).toInt(), 100)
+                        runOnUiThread {
+                            positionTextView.text = if (isUnzipping) "Unzipping model..." else "Downloading model: $progress%"
+                        }
+                    }
+                    WorkInfo.State.SUCCEEDED -> {
+                        runOnUiThread {
+                            positionTextView.text = "Model downloaded successfully."
+                            downloadModelButton.visibility = View.GONE
+                            downloadModelButton.isEnabled = true
+                            downloadModelButton.text = "Download Model"
+                            detectButton.isEnabled = true
+                        }
+                        CoroutineScope(Dispatchers.Main).launch {
+                            deepSceneDiscovery.initialize()
+                        }
+                    }
+                    WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
+                        val errorMessage = workInfo.outputData.getString(DownloadWorker.KEY_MODEL_DOWNLOAD_ERROR_MESSAGE) ?: "Unknown error"
+                        runOnUiThread {
+                            positionTextView.text = "Failed to download model: $errorMessage"
+                            downloadModelButton.isEnabled = true
+                            downloadModelButton.text = "Download Model"
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
+    private fun requestPermissions() {
+        val permissionsToRequest = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.POST_NOTIFICATIONS
+        ).filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (permissionsNeeded.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, permissionsNeeded.toTypedArray(), 1001)
+        if (permissionsToRequest.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, permissionsToRequest.toTypedArray(), REQUEST_PERMISSIONS_CODE)
         } else {
             initializeComponents()
         }
@@ -323,6 +471,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }, 100L)
     }
 
+    private fun startGlowEffect() {
+        val fadeIn = AnimationUtils.loadAnimation(this, R.anim.fade_in)
+        glowViews.forEach {
+            it.visibility = View.VISIBLE
+            it.startAnimation(fadeIn)
+        }
+    }
+
+    private fun stopGlowEffect() {
+        val fadeOut = AnimationUtils.loadAnimation(this, R.anim.fade_out)
+        fadeOut.setAnimationListener(object : Animation.AnimationListener {
+            override fun onAnimationStart(animation: Animation?) {}
+            override fun onAnimationEnd(animation: Animation?) {
+                glowViews.forEach { it.visibility = View.GONE }
+            }
+            override fun onAnimationRepeat(animation: Animation?) {}
+        })
+        glowViews.forEach {
+            it.startAnimation(fadeOut)
+        }
+    }
+
     private fun isLowLight(bitmap: Bitmap, threshold: Int = 60): Boolean {
         val pixels = IntArray(bitmap.width * bitmap.height)
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
@@ -340,13 +510,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun triggerHapticFeedback() {
         val vibrator = getSystemService(Vibrator::class.java)
         if (vibrator.hasVibrator()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val vibrationEffect = VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE)
-                vibrator.vibrate(vibrationEffect)
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(1000)
-            }
+            val vibrationEffect = VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE)
+            vibrator.vibrate(vibrationEffect)
         }
     }
 
@@ -422,16 +587,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             cameraProvider = cameraProviderFuture.get()
-            val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val rotation =
                 display?.rotation ?: Surface.ROTATION_0
-            } else {
-                @Suppress("DEPRECATION")
-                windowManager.defaultDisplay.rotation
-            }
             preview = Preview.Builder().setTargetRotation(rotation).build().also { it.surfaceProvider = previewView.surfaceProvider }
             analysis = ImageAnalysis.Builder()
                 .setTargetRotation(rotation)
-                .setResolutionSelector(ResolutionSelector.Builder().setResolutionStrategy(ResolutionStrategy(Size(640, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build())
+                .setResolutionSelector(ResolutionSelector.Builder().setResolutionStrategy(ResolutionStrategy(
+                    Size(640, 640), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build())
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
@@ -446,7 +608,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (isRecognizerListening || isSpeaking || ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "startVoiceRecognition skipped")
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                runOnUiThread { positionTextView.text = "Audio permission denied. Please grant permission." }
+                runOnUiThread { positionTextView.text = "Audio permission denied. Voice features disabled." }
             }
             return
         }
@@ -454,7 +616,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Log.w(TAG, "No internet connection for voice recognition")
             runOnUiThread {
                 detectButton.visibility = View.VISIBLE
-                detectButton.isEnabled = true
+                detectButton.isEnabled = File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME").exists()
                 if (!hasSpokenOfflineWarning) {
                     speak("No internet connection. Voice recognition unavailable.")
                     hasSpokenOfflineWarning = true
@@ -465,7 +627,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         hasSpokenOfflineWarning = false
         runOnUiThread {
             detectButton.visibility = View.GONE
-            detectButton.isEnabled = true
+            detectButton.isEnabled = deepSceneDiscovery.initializationComplete // Enable only if model is initialized
             if (!hasSpokenDoorWarning) positionTextView.text = "Listening..."
         }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -525,6 +687,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         })
     }
 
+    @SuppressLint("NewApi")
     override fun onResume() {
         super.onResume()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) initSpeechRecognizer()
@@ -535,8 +698,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             shouldDetectCars = false
             shouldDetectChairs = false
             isDeepSceneDiscoveryActive = false
-            detectButton.text = "Detect"
-            runOnUiThread { positionTextView.text = "Waiting for voice commands..." }
+            detectButton.text = "Start Detection"
+            val modelFile = File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME")
+            if (!modelFile.exists()) {
+                downloadModelButton.visibility = View.VISIBLE
+                detectButton.isEnabled = false
+                positionTextView.text = "Please download the model to start detection."
+            } else {
+                positionTextView.text = "Waiting for voice commands..."
+            }
             handler.postDelayed({ startVoiceRecognition() }, 100L)
         } else {
             if (wasDetectingBeforePause) {
@@ -636,26 +806,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun setupFullscreenUI() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.let {
-                it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout())
-                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            window.setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.insetsController?.let {
+            it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout())
+            it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         supportActionBar?.hide()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val rotation =
             display?.rotation ?: Surface.ROTATION_0
-        } else {
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.rotation
-        }
         preview?.targetRotation = rotation
         analysis?.targetRotation = rotation
     }
@@ -838,7 +999,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 positionTextView.visibility = View.VISIBLE
                 positionTextView.isSingleLine = false
                 positionTextView.maxLines = 3
-                positionTextView.text = message
+                positionTextView.text = message // Fixed: Changed from 'model' to 'message'
             }
         }
     }
@@ -987,6 +1148,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun startDeepSceneDiscovery() {
+        if (!deepSceneDiscovery.initializationComplete) {
+            speak("Model is not ready yet")
+            runOnUiThread {
+                positionTextView.text = "Model is not ready yet"
+                detectButton.text = "Start Detection"
+            }
+            return
+        }
+        startGlowEffect()
         swipeInstructionTextView.visibility = View.VISIBLE
         stopDetection()
         isDeepSceneDiscoveryActive = true
@@ -998,6 +1168,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun stopDeepSceneDiscovery() {
+        stopGlowEffect()
         swipeInstructionTextView.visibility = View.GONE
         isDeepSceneDiscoveryActive = false
         deepSceneDiscovery.stop()
@@ -1036,18 +1207,65 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1001) {
-            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-                initializeComponents()
-            } else {
-                val deniedPermissions = permissions.filterIndexed { index, _ -> grantResults[index] != PackageManager.PERMISSION_GRANTED }
-                val errorMessage = when {
-                    deniedPermissions.contains(Manifest.permission.CAMERA) && deniedPermissions.contains(Manifest.permission.RECORD_AUDIO) -> "Camera and audio permissions denied"
-                    deniedPermissions.contains(Manifest.permission.CAMERA) -> "Camera permission denied"
-                    deniedPermissions.contains(Manifest.permission.RECORD_AUDIO) -> "Audio permission denied"
-                    else -> "Required permissions denied"
+        if (requestCode == REQUEST_PERMISSIONS_CODE) {
+            if (permissions.isEmpty() || grantResults.isEmpty()) {
+                runOnUiThread {
+                    positionTextView.text = "Permission request canceled. Camera and notifications required."
+                    downloadModelButton.visibility = View.VISIBLE
+                    detectButton.isEnabled = false
                 }
-                runOnUiThread { positionTextView.text = errorMessage }
+                return
+            }
+
+            val cameraIndex = permissions.indexOf(Manifest.permission.CAMERA)
+            val notificationIndex = permissions.indexOf(Manifest.permission.POST_NOTIFICATIONS)
+            val allPermissionsGranted = permissions.indices.all { grantResults[it] == PackageManager.PERMISSION_GRANTED }
+
+            if (allPermissionsGranted) {
+                initializeComponents()
+                val modelFile = File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME")
+                if (!modelFile.exists()) {
+                    runOnUiThread {
+                        downloadModelButton.visibility = View.VISIBLE
+                        detectButton.isEnabled = false
+                        positionTextView.text = "Please download the model to start detection."
+                        checkExistingDownloads()
+                    }
+                }
+            } else {
+                if (cameraIndex != -1 && grantResults[cameraIndex] != PackageManager.PERMISSION_GRANTED) {
+                    if (!ActivityCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA)) {
+                        runOnUiThread {
+                            positionTextView.text = "Camera permission permanently denied. Please enable in settings."
+                            Toast.makeText(this, "Camera permission required. Go to app settings to enable.", Toast.LENGTH_LONG).show()
+                            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                            intent.data = Uri.fromParts("package", packageName, null)
+                            startActivity(intent)
+                        }
+                    } else {
+                        runOnUiThread {
+                            positionTextView.text = "Camera permission denied. Please grant to proceed."
+                            Toast.makeText(this, "Please grant camera permission.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+                if (notificationIndex != -1 && grantResults[notificationIndex] != PackageManager.PERMISSION_GRANTED) {
+                    runOnUiThread {
+                        positionTextView.text = "Notification permission denied. Download updates may not be shown."
+                        Toast.makeText(this, "Please grant notification permission for download updates.", Toast.LENGTH_LONG).show()
+                    }
+                }
+                if (cameraIndex != -1 && grantResults[cameraIndex] == PackageManager.PERMISSION_GRANTED) {
+                    initializeComponents()
+                    if (!File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME").exists()) {
+                        runOnUiThread {
+                            downloadModelButton.visibility = View.VISIBLE
+                            detectButton.isEnabled = false
+                            positionTextView.text = "Please download the model to start detection."
+                            checkExistingDownloads()
+                        }
+                    }
+                }
             }
         }
     }

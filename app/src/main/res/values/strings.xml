@@ -9,4 +9,5 @@
     <string name="not_enough_lighting_double_tap_to_toggle_flash">Not enough lighting, double tap to toggle flash</string>
     <string name="todo">TODO</string>
     <string name="todo2">TODO2</string>
+    <string name="download_model">Download Model</string>
 </resources>

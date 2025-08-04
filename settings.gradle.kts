@@ -5,6 +5,8 @@ pluginManagement {
                 includeGroupByRegex("com\\.android.*")
                 includeGroupByRegex("com\\.google.*")
                 includeGroupByRegex("androidx.*")
+                // In settings.gradle.kts
+                include(":app", ":gemma_model_pack")
             }
         }
         mavenCentral()
