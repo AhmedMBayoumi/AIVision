@@ -2,9 +2,9 @@
 
 ![AI Vision Assistant Logo](https://placehold.co/600x300/1e293b/ffffff?text=AI+Vision+Assistant)
 
-**AI Vision Assistant** is a powerful Android application designed to aid visually impaired individuals by leveraging state-of-the-art machine learning models. It transforms a standard smartphone camera into an intelligent eye, providing real-time auditory feedback about the user's surroundings. The app combines on-device object detection, advanced depth estimation, and generative AI scene description to create a rich, interactive, and navigable experience.
+**AI Vision Assistant** is a powerful Android application designed to aid visually impaired individuals by leveraging state-of-the-art machine learning models. It transforms a standard smartphone camera into an intelligent eye, providing real-time auditory feedback about the user's surroundings. The app combines on-device object detection, advanced depth estimation, and scene description powered by the Gemma 3B model to create a rich, interactive, and navigable experience.
 
-The entire user interface is driven by intuitive **gestures and voice commands**, ensuring full accessibility without needing to see the screen.
+The entire user interface is driven by intuitive gestures and voice commands, ensuring full accessibility without needing to see the screen.
 
 ---
 
@@ -53,8 +53,7 @@ This project integrates a powerful set of modern Android and Machine Learning te
     * [TensorFlow Lite](https://www.tensorflow.org/lite) for running models on the device.
     * **YOLOv8 & YOLOv11-seg:** State-of-the-art models for object detection and instance segmentation.
     * **MiDaS:** A powerful model for monocular depth estimation.
-* **Machine Learning (Cloud):**
-    * [Google Gemini API](https://ai.google.dev/) for the "Deep Scene Discovery" feature, providing advanced image-to-text descriptions.
+    * ""Gemma 3n**: A lightweight, on-device generative AI model for advanced image-to-text descriptions.
 * **Image Processing:** [OpenCV for Android](https://opencv.org/android/) for classical computer vision tasks like door confirmation and image manipulations.
 * **UI & Asynchronous Tasks:**
     * [Coroutines](https://kotlinlang.org/docs/coroutines-overview.html) for managing background tasks and API calls without blocking the main thread.
@@ -72,14 +71,10 @@ To get this project running on your own device, follow these steps:
     git clone [https://github.com/your-username/ai-vision-assistant.git](https://github.com/your-username/ai-vision-assistant.git)
     ```
 
-2.  **Add Your Gemini API Key:**
-    * Obtain an API key from [Google AI Studio](https://ai.google.dev/).
-    * In the root of the Android project, create a file named `local.properties`.
-    * Add your API key to this file like so:
-        ```properties
-        GEMINI_API_KEY="YOUR_API_KEY_HERE"
-        ```
-    * The project is already configured to read this key from the `BuildConfig` field. This file is included in `.gitignore` to keep your key private.
+2.  **Download and Configure Gemma 3n 4B Model:**
+    * Download the pre-trained Gemma 3n 4B model from a trusted source (e.g., Hugging Face or the official model repository).
+    * Place the model file in the app/src/main/assets/ directory of the Android project.
+    * Ensure the model is optimized for TensorFlow Lite to run efficiently on mobile devices. Refer to the TensorFlow Lite documentation for model conversion instructions if needed.
 
 3.  **Open in Android Studio:**
     * Open Android Studio and select "Open an existing project."
