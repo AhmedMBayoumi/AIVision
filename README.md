@@ -21,8 +21,8 @@ The application is packed with features designed for seamless and eyes-free oper
     * Warns the user about potential collisions and suggests alternative paths (e.g., "The chair is straight ahead, but there is a potted plant in the way. Move right to avoid it...").
     * Includes a proximity alert with haptic feedback (vibration) for imminent collisions.
 
-* **Deep Scene Discovery (Powered by Google Gemini):**
-    * A sophisticated mode that captures the camera feed and sends it to the **Gemini 2.5 Flash** model.
+* **Deep Scene Discovery (Powered by Gemma 3n):**
+    * A sophisticated mode that captures the camera feed and sends it to the **Gemma 3n** local model.
     * Provides a rich, descriptive paragraph of the current scene.
     * Can read and transcribe text found on signs, papers, or posters in the environment.
 
@@ -103,7 +103,7 @@ The application is designed to be used without looking at the screen.
 #### Voice Commands
 After activation, you can use the following commands:
 * **"Detect doors" / "chair" / "car":** Starts the specific object detection mode.
-* **"Deep scene discovery" / "Describe the scene":** Activates the Gemini-powered scene description.
+* **"Deep scene discovery" / "Describe the scene":** Activates the Gemma 3n-powered scene description.
 * **"Stop":** Halts any active detection or discovery mode.
 
 #### Gesture Controls
