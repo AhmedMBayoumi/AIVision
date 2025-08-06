@@ -234,7 +234,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         carButton.setOnClickListener { startDetection("car") }
         detectButton.setOnClickListener { toggleDetection() }
         detectButton.setOnLongClickListener {
-            toggleDoorModel()
+            startDeepSceneDiscovery()
             true
         }
 
@@ -828,16 +828,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun toggleDoorModel() {
-        useYolo12s = !useYolo12s
-        val modelName = if (useYolo12s) "yolo12s" else "yolo8n"
-        if (detectionLogic.loadModels()) {
-            Toast.makeText(this, "Changed model to $modelName", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "Failed to change model to $modelName", Toast.LENGTH_SHORT).show()
-            useYolo12s = !useYolo12s
-        }
-    }
+//    private fun toggleDoorModel() {
+//        useYolo12s = !useYolo12s
+//        val modelName = if (useYolo12s) "yolo12s" else "yolo8n"
+//        if (detectionLogic.loadModels()) {
+//            Toast.makeText(this, "Changed model to $modelName", Toast.LENGTH_SHORT).show()
+//        } else {
+//            Toast.makeText(this, "Failed to change model to $modelName", Toast.LENGTH_SHORT).show()
+//            useYolo12s = !useYolo12s
+//        }
+//    }
 
     private fun onFrame(image: ImageProxy) {
         val currentTime = System.currentTimeMillis()
