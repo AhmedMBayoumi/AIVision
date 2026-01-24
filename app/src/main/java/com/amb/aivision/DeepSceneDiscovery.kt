@@ -11,10 +11,10 @@ import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.lang.IllegalStateException
 
 @SuppressLint("SetTextI18n")
 class DeepSceneDiscovery(private val context: Context) {
@@ -33,7 +33,11 @@ class DeepSceneDiscovery(private val context: Context) {
     private var isProcessing = false
     @Volatile
     private var readyToProcess = false
+    @Volatile
+    private var isActive = false  // Master flag to control if discovery is active
 
+    private var currentSession: LlmInferenceSession? = null
+    private var currentJob: Job? = null
     private val inferenceLock = Any()
 
     suspend fun initialize() {
@@ -74,6 +78,7 @@ class DeepSceneDiscovery(private val context: Context) {
             mainActivity.speak("Model is not ready yet")
             return
         }
+        isActive = true
         isProcessing = false
         readyToProcess = false
         mainActivity.runOnUiThread {
@@ -84,14 +89,31 @@ class DeepSceneDiscovery(private val context: Context) {
     }
 
     fun stop() {
+        Log.d(TAG, "Stopping Deep Scene Discovery")
+        isActive = false  // This will prevent any new processing and stop ongoing operations
         isProcessing = false
         readyToProcess = false
+        
+        // Cancel any ongoing job
+        currentJob?.cancel()
+        currentJob = null
+        
+        // Close current session to interrupt any ongoing generation
+        try {
+            currentSession?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing session: ${e.message}")
+        }
+        currentSession = null
+        
+        // Stop any ongoing speech
         mainActivity.runOnUiThread {
             mainActivity.swipeInstructionTextView.visibility = View.GONE
         }
     }
 
     fun onSpeechFinished() {
+        if (!isActive) return  // Don't restart processing if stopped
         isProcessing = false
         if (!readyToProcess) {
             readyToProcess = true
@@ -99,18 +121,25 @@ class DeepSceneDiscovery(private val context: Context) {
     }
 
     fun processFrame(bitmap: Bitmap) {
-        if (!initializationComplete || isProcessing || !readyToProcess || llmInference == null) {
+        // Check isActive first - if stopped, don't process anything
+        if (!isActive || !initializationComplete || isProcessing || !readyToProcess || llmInference == null) {
             return
         }
 
         isProcessing = true
         mainActivity.runOnUiThread {
-            mainActivity.positionTextView.text = ""
+            mainActivity.positionTextView.text = "Analyzing scene..."
         }
 
-        CoroutineScope(Dispatchers.Default).launch {
-            var newSession: LlmInferenceSession? = null
+        currentJob = CoroutineScope(Dispatchers.Default).launch {
+            var session: LlmInferenceSession? = null
             synchronized(inferenceLock) {
+                // Double-check isActive inside the lock
+                if (!isActive) {
+                    isProcessing = false
+                    return@launch
+                }
+                
                 try {
                     val sessionOptions = LlmInferenceSession.LlmInferenceSessionOptions.builder()
                         .setTopK(40)
@@ -121,7 +150,8 @@ class DeepSceneDiscovery(private val context: Context) {
                                 .build()
                         )
                         .build()
-                    newSession = LlmInferenceSession.createFromOptions(llmInference!!, sessionOptions)
+                    session = LlmInferenceSession.createFromOptions(llmInference!!, sessionOptions)
+                    currentSession = session
 
                     val prompt = "You are a concise AI assistant for the visually impaired. Your response must be direct and follow these rules precisely, in this exact order. Generate only the information requested.\n" +
                             "\n" +
@@ -135,27 +165,57 @@ class DeepSceneDiscovery(private val context: Context) {
                             "    * If none of these three specific objects are visible, omit this section from your response entirely." +
                             "Provide a single cohesive paragraph, do not reply with multiple disjoint points or sentences and do not announce the title of each point like (Scene Description, Text Recognition and Navigation Path). Finally, if there is no path or text then just skip it's point."
 
-                    newSession.addQueryChunk(prompt)
-                    newSession.addImage(BitmapImageBuilder(bitmap).build())
+                    session?.addQueryChunk(prompt)
+                    session?.addImage(BitmapImageBuilder(bitmap).build())
 
-                    val result = newSession.generateResponse()
+                    // Check again before generating
+                    if (!isActive) {
+                        isProcessing = false
+                        return@launch
+                    }
 
-                    mainActivity.runOnUiThread {
-                        mainActivity.positionTextView.text = result
-                        if (result != null) {
-                            mainActivity.speak(result)
+                    // Use streaming response with callback
+                    val responseBuilder = StringBuilder()
+                    session?.generateResponseAsync { partialResult, done ->
+                        // Check if still active before updating UI
+                        if (!isActive) {
+                            return@generateResponseAsync
+                        }
+                        
+                        if (partialResult != null) {
+                            responseBuilder.append(partialResult)
+                            mainActivity.runOnUiThread {
+                                mainActivity.positionTextView.text = responseBuilder.toString()
+                            }
+                        }
+                        
+                        if (done) {
+                            val finalResult = responseBuilder.toString()
+                            if (isActive && finalResult.isNotEmpty()) {
+                                mainActivity.runOnUiThread {
+                                    mainActivity.positionTextView.text = finalResult
+                                    mainActivity.speak(finalResult)
+                                }
+                            }
+                            onSpeechFinished()
                         }
                     }
-                    onSpeechFinished()
 
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during inference", e)
-                    mainActivity.runOnUiThread {
-                        mainActivity.speak("There was an error during analysis.")
+                    if (isActive) {
+                        mainActivity.runOnUiThread {
+                            mainActivity.positionTextView.text = "Error analyzing scene"
+                            mainActivity.speak("There was an error during analysis.")
+                        }
                     }
                     onSpeechFinished()
                 } finally {
-                    newSession?.close()
+                    // Only close if we're stopping or done
+                    if (!isActive) {
+                        session?.close()
+                        currentSession = null
+                    }
                 }
             }
         }

@@ -115,7 +115,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     var shouldDetectDoors = false
     var shouldDetectCars = false
     var shouldDetectChairs = false
-    var shouldDetect = shouldDetectDoors || shouldDetectCars || shouldDetectChairs
+    var shouldDetect = false
     private var isDeepSceneDiscoveryActive = false
     private var canProcess = true
     var useYolo12s = false
@@ -201,7 +201,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         // Initialize Gemma model immediately on app start
         CoroutineScope(Dispatchers.Main).launch {
-            deepSceneDiscovery.initialize()
+            try {
+                deepSceneDiscovery.initialize()
+                runOnUiThread {
+                    if (deepSceneDiscovery.initializationComplete) {
+                        positionTextView.text = "Models ready. Waiting for voice commands..."
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "LLM initialization failed: ${e.message}", e)
+                // LLM not available - YOLO detection still works
+            }
         }
 
         checkModelAvailability()
@@ -251,23 +261,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (modelFile.exists() && modelFile.length() >= expectedSize) {
             runOnUiThread {
                 downloadModelButton.visibility = View.GONE
-                detectButton.isEnabled = true
-                positionTextView.text = "Model already downloaded."
+                // detectButton is enabled by YOLO loading in initializeComponents, not LLM
+                positionTextView.text = "LLM model ready."
             }
             return true
         } else if (modelFile.exists() && modelFile.length() < expectedSize) {
             runOnUiThread {
                 downloadModelButton.visibility = View.VISIBLE
-                detectButton.isEnabled = false
-                positionTextView.text = "Partial model detected. Please resume download."
+                positionTextView.text = "Partial LLM model detected. Resume download for scene description."
             }
             checkExistingDownloads()
             return false
         } else {
             runOnUiThread {
                 downloadModelButton.visibility = View.VISIBLE
-                detectButton.isEnabled = false
-                positionTextView.text = "Please download the model to start detection."
+                positionTextView.text = "Download LLM model for scene description, or use object detection."
             }
             checkExistingDownloads()
             return false
@@ -626,7 +634,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         hasSpokenOfflineWarning = false
         runOnUiThread {
             detectButton.visibility = View.GONE
-            detectButton.isEnabled = deepSceneDiscovery.initializationComplete // Enable only if model is initialized
+            detectButton.isEnabled = true // YOLO models are always loaded, LLM check happens in startDeepSceneDiscovery
             if (!hasSpokenDoorWarning) positionTextView.text = "Listening..."
         }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -701,8 +709,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val modelFile = File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME")
             if (!modelFile.exists()) {
                 downloadModelButton.visibility = View.VISIBLE
-                detectButton.isEnabled = false
-                positionTextView.text = "Please download the model to start detection."
+                // detectButton managed by YOLO loading, not LLM
+                positionTextView.text = "Download LLM for scene description, or use object detection."
             } else {
                 positionTextView.text = "Waiting for voice commands..."
             }
@@ -755,8 +763,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (isDeepSceneDiscoveryActive) deepSceneDiscovery.onSpeechFinished()
                     if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) handler.post { startVoiceRecognition() }
                 }
-                @Deprecated("Deprecated in Java")
+                @Deprecated("Deprecated in Java", ReplaceWith("onError(utteranceId, errorCode)"))
                 override fun onError(utteranceId: String?) {
+                    handleTtsError(utteranceId, -1)
+                }
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    handleTtsError(utteranceId, errorCode)
+                }
+                private fun handleTtsError(utteranceId: String?, errorCode: Int) {
+                    Log.e(TAG, "TTS error for utterance $utteranceId, code: $errorCode")
                     isSpeaking = false
                     if (isDeepSceneDiscoveryActive) deepSceneDiscovery.onSpeechFinished()
                     if ((isVoiceActive || !shouldDetect) && !isRecognizerListening) handler.post { startVoiceRecognition() }
@@ -886,10 +901,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 canProcess = true
                 return
             }
+            // Compute depth map once for all detection types
+            val fullDepthMap = detectionLogic.runDepthEstimation(bmp)
             val (targetBox, position, depthMeters) = when {
                 shouldDetectDoors -> {
                     val (doorBox, pos) = detectionLogic.detectDoor(bmp)
-                    val fullDepthMap = detectionLogic.runDepthEstimation(bmp)
                     val doorDepth = if (doorBox != null) {
                         val rawDoorDepth = detectionLogic.avgDepthInBoxFixed(fullDepthMap, doorBox, bmp.width, bmp.height)
                         if (rawDoorDepth.isFinite()) DEPTH_SCALE_FACTOR / rawDoorDepth else Float.MAX_VALUE
@@ -898,7 +914,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 shouldDetectChairs -> {
                     val (chairBox, pos) = detectionLogic.detectChair(bmp)
-                    val fullDepthMap = detectionLogic.runDepthEstimation(bmp)
                     val chairDepth = if (chairBox != null) {
                         val rawChairDepth = detectionLogic.avgDepthInBoxFixed(fullDepthMap, chairBox, bmp.width, bmp.height)
                         if (rawChairDepth.isFinite()) DEPTH_SCALE_FACTOR / rawChairDepth else Float.MAX_VALUE
@@ -907,7 +922,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 shouldDetectCars -> {
                     val (carBox, pos) = detectionLogic.detectCar(bmp)
-                    val fullDepthMap = detectionLogic.runDepthEstimation(bmp)
                     val carDepth = if (carBox != null) {
                         val rawCarDepth = detectionLogic.avgDepthInBoxFixed(fullDepthMap, carBox, bmp.width, bmp.height)
                         if (rawCarDepth.isFinite()) DEPTH_SCALE_FACTOR / rawCarDepth else Float.MAX_VALUE
@@ -916,7 +930,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 else -> Triple(null, "", Float.MAX_VALUE)
             }
-            val fullDepthMap = detectionLogic.runDepthEstimation(bmp)
             val obstacles = detectionLogic.runSegmentation(bmp)
             val mappedObstacles = obstacles.map { obstacle ->
                 val mappedMask = mapMaskToOriginal(obstacle.mask, bmp.width, bmp.height)
@@ -1018,6 +1031,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     fun speak(msg: String) {
+        if (!::tts.isInitialized) return
         tts.stop()
         val params = Bundle()
         params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "messageId")
@@ -1171,6 +1185,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         swipeInstructionTextView.visibility = View.GONE
         isDeepSceneDiscoveryActive = false
         deepSceneDiscovery.stop()
+        // Stop any ongoing TTS immediately
+        if (::tts.isInitialized) {
+            tts.stop()
+        }
         isVoiceActive = false
         hasGreeted = false
         runOnUiThread {
@@ -1226,8 +1244,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 if (!modelFile.exists()) {
                     runOnUiThread {
                         downloadModelButton.visibility = View.VISIBLE
-                        detectButton.isEnabled = false
-                        positionTextView.text = "Please download the model to start detection."
+                        // detectButton enabled by YOLO loading, not LLM
+                        positionTextView.text = "Download LLM for scene description, or use object detection."
                         checkExistingDownloads()
                     }
                 }
@@ -1259,8 +1277,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (!File(getExternalFilesDir(null), "$modelDIR/$MODEL_FILE_NAME").exists()) {
                         runOnUiThread {
                             downloadModelButton.visibility = View.VISIBLE
-                            detectButton.isEnabled = false
-                            positionTextView.text = "Please download the model to start detection."
+                            // detectButton enabled by YOLO loading, not LLM
+                            positionTextView.text = "Download LLM for scene description, or use object detection."
                             checkExistingDownloads()
                         }
                     }
