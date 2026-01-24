@@ -33,6 +33,7 @@ class DetectionLogic(private val context: MainActivity) {
     companion object {
         private const val PROCESSING_SIZE = 256
         private const val DETECTION_RESOLUTION = 640
+        private const val DEPTH_RESOLUTION = 518  // Depth-Anything-V2 requires exactly 518x518
         private const val YOLO26_MAX_DETECTIONS = 300
         private const val YOLO26_FEATURES = 38  // 4 bbox + 2 confidence + 32 mask coefs
         private const val YOLO26_PROTO_SIZE = 160
@@ -183,33 +184,53 @@ class DetectionLogic(private val context: MainActivity) {
                 Log.d(TAG, "YOLO26 loaded with CPU (multi-threaded)")
             }
 
+            // Load Depth-Anything-V2 model (optimized for NPU via NNAPI)
             val depthModel = try {
-                FileUtil.loadMappedFile(context, "MiDas.tflite")
+                FileUtil.loadMappedFile(context, "Depth-Anything-V2.tflite")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to load depth model: ${e.message}", e)
+                Log.e(TAG, "Failed to load Depth-Anything-V2 model: ${e.message}", e)
                 context.runOnUiThread {
                     context.positionTextView.text = "Error loading depth model: ${e.message}"
                 }
                 return false
             }
 
-            if (useGpu) {
+            // Try NNAPI first for NPU acceleration
+            var depthLoaded = false
+            try {
+                val nnapiOptions = Interpreter.Options().apply {
+                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                    useNNAPI = true
+                }
+                depthInterpreter = Interpreter(depthModel, nnapiOptions)
+                depthLoaded = true
+                Log.d(TAG, "Depth-Anything-V2 loaded with NNAPI (NPU acceleration)")
+            } catch (e: Exception) {
+                Log.w(TAG, "NNAPI failed for depth: ${e.message}. Trying GPU...")
+            }
+            
+            // Fallback to GPU delegate
+            if (!depthLoaded && compatList.isDelegateSupportedOnThisDevice) {
                 try {
                     val gpuOptions = Interpreter.Options()
                     depthGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(depthGpuDelegate)
                     depthInterpreter = Interpreter(depthModel, gpuOptions)
+                    depthLoaded = true
+                    Log.d(TAG, "Depth-Anything-V2 loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(TAG, "GPU delegate failed for depth: ${e.message}. Falling back to CPU.", e)
-                    useGpu = false
+                    Log.w(TAG, "GPU delegate failed for depth: ${e.message}. Falling back to CPU.")
                 }
             }
-            if (!useGpu) {
+            
+            // Final fallback to CPU
+            if (!depthLoaded) {
                 val cpuOptions = Interpreter.Options().apply {
                     numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
                     useNNAPI = false
                 }
                 depthInterpreter = Interpreter(depthModel, cpuOptions)
+                Log.d(TAG, "Depth-Anything-V2 loaded with CPU")
             }
 
             return true
@@ -231,9 +252,10 @@ class DetectionLogic(private val context: MainActivity) {
             .add(NormalizeOp(0f, 255f))
             .build()
 
+        // Depth-Anything-V2 processor: 518x518 input, simple /255 normalization
         depthProcessor = ImageProcessor.Builder()
-            .add(ResizeOp(PROCESSING_SIZE, PROCESSING_SIZE, ResizeOp.ResizeMethod.BILINEAR))
-            .add(NormalizeOp(0f, 255f))
+            .add(ResizeOp(DEPTH_RESOLUTION, DEPTH_RESOLUTION, ResizeOp.ResizeMethod.BILINEAR))
+            .add(NormalizeOp(0f, 255f))  // Scales to [0, 1] range
             .build()
 
         // YOLO26 processor - int8 model expects pixel values normalized differently
@@ -599,32 +621,50 @@ class DetectionLogic(private val context: MainActivity) {
         return runYolo26Segmentation(roi, listOf("car"))
     }
 
+    /**
+     * Run depth estimation using Depth-Anything-V2
+     * Input: 518x518x3, Output: 518x518 relative depth (higher values = farther)
+     * We invert the output so higher values = closer (for proximity calculations)
+     */
     fun runDepthEstimation(bmp: Bitmap): Array<FloatArray> {
         try {
             val ti = TensorImage(DataType.FLOAT32)
             ti.load(bmp)
             val input = depthProcessor.process(ti).buffer
+            input.rewind()
+            
             val outShape = depthInterpreter.getOutputTensor(0).shape()
+            Log.d(TAG, "Depth output shape: ${outShape.joinToString()}")
+            
             val depthMap = when (outShape.size) {
                 4 -> {
+                    // Shape: (1, H, W, 1)
                     val raw = Array(outShape[0]) { Array(outShape[1]) { Array(outShape[2]) { FloatArray(outShape[3]) } } }
                     depthInterpreter.run(input, raw)
-                    Array(outShape[1]) { y -> FloatArray(outShape[2]) { x -> raw[0][y][x][0] } }
+                    Array(outShape[1]) { y -> FloatArray(outShape[2]) { x -> 1.0f - raw[0][y][x][0] } }  // Invert: higher=closer
                 }
                 3 -> {
+                    // Shape: (1, 518, 518) - expected for Depth-Anything-V2
                     val raw = Array(outShape[0]) { Array(outShape[1]) { FloatArray(outShape[2]) } }
                     depthInterpreter.run(input, raw)
-                    raw[0]
+                    // Invert values: Depth-Anything-V2 outputs higher=farther, we need higher=closer
+                    Array(outShape[1]) { y -> FloatArray(outShape[2]) { x -> 1.0f - raw[0][y][x] } }
+                }
+                2 -> {
+                    // Shape: (518, 518) - unlikely but handle it
+                    val raw = Array(outShape[0]) { FloatArray(outShape[1]) }
+                    depthInterpreter.run(input, raw)
+                    Array(outShape[0]) { y -> FloatArray(outShape[1]) { x -> 1.0f - raw[y][x] } }
                 }
                 else -> {
                     Log.e(TAG, "Unsupported depth output shape: ${outShape.joinToString()}")
-                    Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) { Float.MAX_VALUE } }
+                    Array(DEPTH_RESOLUTION) { FloatArray(DEPTH_RESOLUTION) { Float.MAX_VALUE } }
                 }
             }
             return depthMap
         } catch (e: Exception) {
             Log.e(TAG, "Depth estimation error: ${e.message}", e)
-            return Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) { Float.MAX_VALUE } }
+            return Array(DEPTH_RESOLUTION) { FloatArray(DEPTH_RESOLUTION) { Float.MAX_VALUE } }
         }
     }
 

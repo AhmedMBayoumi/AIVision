@@ -118,7 +118,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     var shouldDetect = false
     private var isDeepSceneDiscoveryActive = false
     private var canProcess = true
-    var useYolo12s = false
+    var useYolo12s = true
     private var isFirstLaunch = true
     private var initialOfflineWarningSent = false
     private var hasGreeted = false
