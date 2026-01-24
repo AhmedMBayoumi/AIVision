@@ -501,6 +501,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun isLowLight(bitmap: Bitmap, threshold: Int = 60): Boolean {
+        val avgLuminance = computeAmbientLightLevel(bitmap)
+        return avgLuminance < threshold
+    }
+
+    /**
+     * Compute ambient light level from bitmap (0-255 scale)
+     */
+    private fun computeAmbientLightLevel(bitmap: Bitmap): Float {
         val pixels = IntArray(bitmap.width * bitmap.height)
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
         var totalLuminance = 0.0
@@ -510,8 +518,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val b = Color.blue(pixel)
             totalLuminance += (0.299 * r + 0.587 * g + 0.114 * b)
         }
-        val avgLuminance = totalLuminance / pixels.size
-        return avgLuminance < threshold
+        return (totalLuminance / pixels.size).toFloat()
     }
 
     private fun triggerHapticFeedback() {
@@ -930,7 +937,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 else -> Triple(null, "", Float.MAX_VALUE)
             }
-            val obstacles = detectionLogic.runSegmentation(bmp)
+            // Compute ambient light and update adaptive parameters
+            val ambientLight = computeAmbientLightLevel(bmp) / 255f  // Normalize to 0-1
+            detectionLogic.updateAmbientLight(ambientLight)
+            
+            // Use YOLO26 segmentation with NPU acceleration
+            val obstacles = detectionLogic.runSmartSegmentation(bmp)
             val mappedObstacles = obstacles.map { obstacle ->
                 val mappedMask = mapMaskToOriginal(obstacle.mask, bmp.width, bmp.height)
                 DetectionLogic.Obstacle(obstacle.box, mappedMask, obstacle.className)
@@ -1065,7 +1077,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return when (position) {
             "left" -> {
                 val rightHalf = Bitmap.createBitmap(bitmap, bitmap.width / 2, 0, bitmap.width / 2, bitmap.height)
-                val rightObstacles = detectionLogic.runSegmentation(rightHalf).filter { it.className != targetClass }
+                val rightObstacles = detectionLogic.runSmartSegmentation(rightHalf).filter { it.className != targetClass }
                 if (rightObstacles.isEmpty()) {
                     "The $targetClass is to your left, but there is $obstacleNames in the way. Move right to avoid it, then turn left."
                 } else {
@@ -1075,7 +1087,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             "right" -> {
                 val leftHalf = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width / 2, bitmap.height)
-                val leftObstacles = detectionLogic.runSegmentation(leftHalf).filter { it.className != targetClass }
+                val leftObstacles = detectionLogic.runSmartSegmentation(leftHalf).filter { it.className != targetClass }
                 if (leftObstacles.isEmpty()) {
                     "The $targetClass is to your right, but there is $obstacleNames in the way. Move left to avoid it, then turn right."
                 } else {
@@ -1085,12 +1097,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             else -> {
                 val rightThird = Bitmap.createBitmap(bitmap, bitmap.width * 2 / 3, 0, bitmap.width / 3, bitmap.height)
-                val rightObstacles = detectionLogic.runSegmentation(rightThird).filter { it.className != targetClass }
+                val rightObstacles = detectionLogic.runSmartSegmentation(rightThird).filter { it.className != targetClass }
                 if (rightObstacles.isEmpty()) {
                     "The $targetClass is straight ahead, but there is $obstacleNames in the way. Move right to avoid it, then continue forward."
                 } else {
                     val leftThird = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width / 3, bitmap.height)
-                    val leftObstacles = detectionLogic.runSegmentation(leftThird).filter { it.className != targetClass }
+                    val leftObstacles = detectionLogic.runSmartSegmentation(leftThird).filter { it.className != targetClass }
                     if (leftObstacles.isEmpty()) {
                         "The $targetClass is straight ahead, but there is $obstacleNames in the way. Move left to avoid it, then continue forward."
                     } else {

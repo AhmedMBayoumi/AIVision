@@ -18,6 +18,8 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.exp
@@ -31,7 +33,35 @@ class DetectionLogic(private val context: MainActivity) {
     companion object {
         private const val PROCESSING_SIZE = 256
         private const val DETECTION_RESOLUTION = 640
+        private const val YOLO26_MAX_DETECTIONS = 300
+        private const val YOLO26_FEATURES = 38  // 4 bbox + 2 confidence + 32 mask coefs
+        private const val YOLO26_PROTO_SIZE = 160
+        private const val YOLO26_MASK_COEFS = 32
+        private const val TEMPORAL_WINDOW_SIZE = 3
     }
+
+    // Adaptive parameters that adjust based on environment
+    data class AdaptiveParams(
+        var detectionThreshold: Float = 0.45f,
+        var proximityThresholdClose: Float = 0.25f,  // meters for "you have reached"
+        var proximityThresholdWarn: Float = 0.5f,    // meters for obstacle warning
+        var iouThreshold: Float = 0.5f,
+        var depthScaleFactor: Float = 100.0f,
+        var maskThreshold: Float = 0.5f
+    )
+
+    private val params = AdaptiveParams()
+    private var currentAmbientLight: Float = 1.0f  // 0.0 = dark, 1.0 = bright
+
+    // Temporal smoothing - track recent detections
+    data class DetectionHistory(
+        val className: String,
+        val position: String,
+        val confidence: Float,
+        val timestamp: Long
+    )
+    private val recentDetections = mutableListOf<DetectionHistory>()
+    private val historyMaxAge = 1000L  // 1 second window
 
     private val classNames = listOf(
         "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -50,14 +80,14 @@ class DetectionLogic(private val context: MainActivity) {
 
     private lateinit var tflite: Interpreter
     private var gpuDelegate: GpuDelegate? = null
-    private lateinit var segInterpreter: Interpreter
-    private var segGpuDelegate: GpuDelegate? = null
+    private lateinit var yolo26SegInterpreter: Interpreter  // YOLO26 NMS-free segmentation (NPU accelerated)
     private lateinit var depthInterpreter: Interpreter
     private var depthGpuDelegate: GpuDelegate? = null
 
     private lateinit var detectionProcessor: ImageProcessor
     private lateinit var imageProcessor: ImageProcessor
     private lateinit var depthProcessor: ImageProcessor
+    private lateinit var yolo26Processor: ImageProcessor  // For YOLO26's 640x640 input
 
     private var numDetections: Int = 0
 
@@ -103,33 +133,54 @@ class DetectionLogic(private val context: MainActivity) {
             }
             numDetections = tflite.getOutputTensor(0).shape()[2]
 
-            val segModel = try {
-                FileUtil.loadMappedFile(context, "yolo11s-seg.tflite")
+            // Load YOLO26 segmentation model (int8 quantized - optimized for NPU via NNAPI)
+            val yolo26Model = try {
+                FileUtil.loadMappedFile(context, "yolo26n-seg_int8.tflite")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to load segmentation model: ${e.message}", e)
+                Log.e(TAG, "Failed to load YOLO26 segmentation model: ${e.message}", e)
                 context.runOnUiThread {
-                    context.positionTextView.text = "Error loading segmentation model: ${e.message}"
+                    context.positionTextView.text = "Error loading YOLO26 model: ${e.message}"
                 }
                 return false
             }
 
-            if (useGpu) {
+            // Try NNAPI first (leverages NPU on supported devices like Qualcomm, Samsung, MediaTek)
+            // NNAPI provides hardware acceleration and can use NPU, DSP, or GPU depending on device
+            var yolo26Loaded = false
+            try {
+                val nnapiOptions = Interpreter.Options().apply {
+                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                    useNNAPI = true  // Enable NNAPI for NPU/DSP acceleration
+                }
+                yolo26SegInterpreter = Interpreter(yolo26Model, nnapiOptions)
+                yolo26Loaded = true
+                Log.d(TAG, "YOLO26 loaded with NNAPI (NPU/DSP acceleration enabled)")
+            } catch (e: Exception) {
+                Log.w(TAG, "NNAPI failed for YOLO26: ${e.message}. Trying GPU delegate...")
+            }
+            
+            // Fallback to GPU delegate if NNAPI fails
+            if (!yolo26Loaded && compatList.isDelegateSupportedOnThisDevice) {
                 try {
                     val gpuOptions = Interpreter.Options()
-                    segGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
-                    gpuOptions.addDelegate(segGpuDelegate)
-                    segInterpreter = Interpreter(segModel, gpuOptions)
+                    val gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+                    gpuOptions.addDelegate(gpuDelegate)
+                    yolo26SegInterpreter = Interpreter(yolo26Model, gpuOptions)
+                    yolo26Loaded = true
+                    Log.d(TAG, "YOLO26 loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(TAG, "GPU delegate failed for seg: ${e.message}. Falling back to CPU.", e)
-                    useGpu = false
+                    Log.w(TAG, "GPU delegate failed for YOLO26: ${e.message}. Falling back to CPU.")
                 }
             }
-            if (!useGpu) {
+            
+            // Final fallback to multi-threaded CPU
+            if (!yolo26Loaded) {
                 val cpuOptions = Interpreter.Options().apply {
                     numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
                     useNNAPI = false
                 }
-                segInterpreter = Interpreter(segModel, cpuOptions)
+                yolo26SegInterpreter = Interpreter(yolo26Model, cpuOptions)
+                Log.d(TAG, "YOLO26 loaded with CPU (multi-threaded)")
             }
 
             val depthModel = try {
@@ -184,6 +235,42 @@ class DetectionLogic(private val context: MainActivity) {
             .add(ResizeOp(PROCESSING_SIZE, PROCESSING_SIZE, ResizeOp.ResizeMethod.BILINEAR))
             .add(NormalizeOp(0f, 255f))
             .build()
+
+        // YOLO26 processor - int8 model expects pixel values normalized differently
+        yolo26Processor = ImageProcessor.Builder()
+            .add(ResizeOp(DETECTION_RESOLUTION, DETECTION_RESOLUTION, ResizeOp.ResizeMethod.BILINEAR))
+            .add(NormalizeOp(0f, 255f))
+            .build()
+    }
+
+    /**
+     * Update adaptive parameters based on ambient light level (0.0 = dark, 1.0 = bright)
+     */
+    fun updateAmbientLight(lightLevel: Float) {
+        currentAmbientLight = lightLevel.coerceIn(0f, 1f)
+        // Lower detection threshold in low light (more sensitive, but accept lower confidence)
+        params.detectionThreshold = if (lightLevel < 0.3f) 0.35f else 0.45f
+        // Increase proximity warning in low light (be more cautious)
+        params.proximityThresholdWarn = if (lightLevel < 0.3f) 0.7f else 0.5f
+    }
+
+    /**
+     * Add detection to temporal history and check if it should be announced
+     */
+    private fun shouldAnnounceDetection(className: String, position: String, confidence: Float): Boolean {
+        val now = System.currentTimeMillis()
+        
+        // Prune old entries
+        recentDetections.removeAll { now - it.timestamp > historyMaxAge }
+        
+        // Add current detection
+        recentDetections.add(DetectionHistory(className, position, confidence, now))
+        
+        // Count matching detections in recent history
+        val matchingCount = recentDetections.count { it.className == className && it.position == position }
+        
+        // Require at least 2 consistent detections to announce
+        return matchingCount >= 2
     }
 
     fun detectDoor(bitmap: Bitmap): Pair<RectF?, String> {
@@ -285,255 +372,231 @@ class DetectionLogic(private val context: MainActivity) {
         return Pair(null, "")
     }
 
+    /**
+     * Run segmentation using YOLO26 model
+     * This is the primary segmentation method - always uses YOLO26 with NPU acceleration
+     */
     fun runSegmentation(roi: Bitmap): List<Obstacle> {
+        return runYolo26Segmentation(roi)
+    }
+
+    /**
+     * Run YOLO26 NMS-free segmentation - newer architecture with end-to-end detection
+     * Output format: (1, 300, 38) where 38 = 4 bbox + 2 confidence + 32 mask coefficients
+     * No NMS required as YOLO26 uses a one-to-one head for end-to-end predictions
+     */
+    fun runYolo26Segmentation(roi: Bitmap, filterClasses: List<String>? = null): List<Obstacle> {
+        if (!::yolo26SegInterpreter.isInitialized) {
+            Log.e(TAG, "YOLO26 segmentation interpreter not initialized")
+            return emptyList()
+        }
+        
         try {
             val ti = TensorImage(DataType.FLOAT32)
             ti.load(roi)
-            val input = imageProcessor.process(ti).buffer
-            val detShape = segInterpreter.getOutputTensor(0).shape()
-            val protoShape = segInterpreter.getOutputTensor(1).shape()
-            val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
-            val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
-            val outputs = mapOf(0 to detOut, 1 to protoOut)
-            segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
-            val raw = detOut[0]
-            val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
-            val numClasses = 80
-            val maskCoefsCount = detShape[1] - 4 - numClasses
-            val maskCoefsStartIdx = 4 + numClasses
-            for (i in 0 until detShape[2]) {
-                var maxClassProb = 0f
-                var maxClassIdx = -1
-                for (c in 0 until numClasses) {
-                    val prob = raw[4 + c][i]
-                    if (prob > maxClassProb) {
-                        maxClassProb = prob
-                        maxClassIdx = c
+            val processedImage = yolo26Processor.process(ti)
+            val inputBuffer = processedImage.buffer
+            inputBuffer.rewind()
+            
+            // Get output tensor info for dequantization
+            val detTensor = yolo26SegInterpreter.getOutputTensor(0)
+            val protoTensor = yolo26SegInterpreter.getOutputTensor(1)
+            
+            // Output shapes: (1, 300, 38) and (1, 32, 160, 160)
+            val detShape = detTensor.shape()
+            val protoShape = protoTensor.shape()
+            
+            Log.d(TAG, "YOLO26 det shape: ${detShape.joinToString()}, proto shape: ${protoShape.joinToString()}")
+            
+            // Allocate output buffers based on model output type
+            val numSlots = if (detShape.size == 3) detShape[1] else YOLO26_MAX_DETECTIONS
+            val numFeatures = if (detShape.size == 3) detShape[2] else YOLO26_FEATURES
+            
+            // For int8 output, use ByteBuffer then dequantize
+            val detOut: Array<FloatArray>
+            val protoOut: Array<Array<FloatArray>>
+            
+            if (detTensor.dataType() == DataType.INT8 || detTensor.dataType() == DataType.UINT8) {
+                // Int8 quantized output - need to dequantize
+                val detParams = detTensor.quantizationParams()
+                val protoParams = protoTensor.quantizationParams()
+                
+                val detByteBuffer = ByteBuffer.allocateDirect(numSlots * numFeatures)
+                    .order(ByteOrder.nativeOrder())
+                val protoByteBuffer = ByteBuffer.allocateDirect(YOLO26_MASK_COEFS * YOLO26_PROTO_SIZE * YOLO26_PROTO_SIZE)
+                    .order(ByteOrder.nativeOrder())
+                
+                val outputs = mapOf(0 to detByteBuffer, 1 to protoByteBuffer)
+                yolo26SegInterpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
+                
+                // Dequantize det output
+                detByteBuffer.rewind()
+                detOut = Array(numSlots) { FloatArray(numFeatures) }
+                for (i in 0 until numSlots) {
+                    for (j in 0 until numFeatures) {
+                        val quantizedValue = (detByteBuffer.get().toInt() and 0xFF)  // uint8 to int
+                        detOut[i][j] = detParams.scale * (quantizedValue - detParams.zeroPoint)
                     }
                 }
-                if (maxClassProb > threshold) {
-                    val cx = raw[0][i] * roi.width
-                    val cy = raw[1][i] * roi.height
-                    val ww = raw[2][i] * roi.width
-                    val hh = raw[3][i] * roi.height
-                    val box = RectF(cx - ww / 2, cy - hh / 2, cx + ww / 2, cy + hh / 2)
-                    val maskCoefs = FloatArray(maskCoefsCount) { c ->
-                        val idx = maskCoefsStartIdx + c
-                        if (idx < detShape[1]) raw[idx][i] else 0f
+                
+                // Dequantize proto output
+                protoByteBuffer.rewind()
+                protoOut = Array(YOLO26_MASK_COEFS) { Array(YOLO26_PROTO_SIZE) { FloatArray(YOLO26_PROTO_SIZE) } }
+                for (c in 0 until YOLO26_MASK_COEFS) {
+                    for (y in 0 until YOLO26_PROTO_SIZE) {
+                        for (x in 0 until YOLO26_PROTO_SIZE) {
+                            val quantizedValue = (protoByteBuffer.get().toInt() and 0xFF)
+                            protoOut[c][y][x] = protoParams.scale * (quantizedValue - protoParams.zeroPoint)
+                        }
                     }
-                    val className = if (maxClassIdx >= 0 && maxClassIdx < classNames.size) classNames[maxClassIdx] else "Unknown"
-                    dets += Triple(box, maskCoefs, className)
                 }
+            } else {
+                // Float32 output
+                val detFloatOut = Array(1) { Array(numSlots) { FloatArray(numFeatures) } }
+                val protoFloatOut = Array(1) { Array(YOLO26_MASK_COEFS) { Array(YOLO26_PROTO_SIZE) { FloatArray(YOLO26_PROTO_SIZE) } } }
+                val outputs = mapOf(0 to detFloatOut, 1 to protoFloatOut)
+                yolo26SegInterpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
+                detOut = detFloatOut[0]
+                protoOut = protoFloatOut[0]
             }
-            val final = applyNMS(dets, 0.6f)
+            
             val obstacles = mutableListOf<Obstacle>()
-            val protoH = protoShape[1]
-            val protoW = protoShape[2]
-            val protoC = protoShape[3]
-            for ((box, coefs, className) in final) {
+            val threshold = params.detectionThreshold
+            
+            // YOLO26 output: each row is [x, y, w, h, conf1, conf2, mask_coef_0...mask_coef_31]
+            // conf1 and conf2 are objectness scores from dual heads, we use max
+            for (i in 0 until numSlots) {
+                val row = detOut[i]
+                if (row.size < 6) continue
+                
+                val x = row[0]  // center x (normalized 0-1)
+                val y = row[1]  // center y (normalized 0-1)
+                val w = row[2]  // width (normalized)
+                val h = row[3]  // height (normalized)
+                val conf1 = row[4]
+                val conf2 = row[5]
+                val confidence = max(conf1, conf2)
+                
+                if (confidence <= threshold || confidence.isNaN() || !confidence.isFinite()) continue
+                
+                // Get mask coefficients (32 values)
+                val maskCoefs = FloatArray(YOLO26_MASK_COEFS) { c ->
+                    if (6 + c < row.size) row[6 + c] else 0f
+                }
+                
+                // Scale box to image coordinates
+                val cx = x * roi.width
+                val cy = y * roi.height
+                val ww = w * roi.width
+                val hh = h * roi.height
+                val box = RectF(cx - ww / 2, cy - hh / 2, cx + ww / 2, cy + hh / 2)
+                
+                // Validate box
+                if (box.width() < 10 || box.height() < 10) continue
+                if (box.left < 0 || box.top < 0 || box.right > roi.width || box.bottom > roi.height) {
+                    // Clip to image bounds
+                    box.left = max(0f, box.left)
+                    box.top = max(0f, box.top)
+                    box.right = min(roi.width.toFloat(), box.right)
+                    box.bottom = min(roi.height.toFloat(), box.bottom)
+                }
+                
+                // Generate mask from proto and coefficients
                 try {
-                    val mask = Array(256) { FloatArray(256) }
+                    val mask = Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) }
                     var activePixels = 0
-                    for (dy in 0 until 256) {
-                        for (dx in 0 until 256) {
-                            val py = (dy * protoH / 256).coerceIn(0, protoH - 1)
-                            val px = (dx * protoW / 256).coerceIn(0, protoW - 1)
+                    
+                    for (dy in 0 until PROCESSING_SIZE) {
+                        for (dx in 0 until PROCESSING_SIZE) {
+                            val py = (dy * YOLO26_PROTO_SIZE / PROCESSING_SIZE).coerceIn(0, YOLO26_PROTO_SIZE - 1)
+                            val px = (dx * YOLO26_PROTO_SIZE / PROCESSING_SIZE).coerceIn(0, YOLO26_PROTO_SIZE - 1)
+                            
                             var maskValue = 0f
-                            for (c in 0 until minOf(coefs.size, protoC)) {
-                                maskValue += coefs[c] * protoOut[0][py][px][c]
+                            for (c in 0 until YOLO26_MASK_COEFS) {
+                                maskValue += maskCoefs[c] * protoOut[c][py][px]
                             }
+                            // Apply sigmoid
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.01f) {
+                            
+                            if (maskValue > params.maskThreshold) {
                                 mask[dy][dx] = 1f
                                 activePixels++
                             }
                         }
                     }
+                    
                     if (activePixels >= 50) {
-                        if ((context.shouldDetectCars && className == "car") || (context.shouldDetectChairs && className == "chair")) {
+                        // YOLO26 doesn't provide class info in this format, infer from mask shape
+                        val aspectRatio = box.height() / max(1f, box.width())
+                        val className = inferClassFromAspectRatio(aspectRatio, box, roi)
+                        
+                        // Apply filter if specified
+                        if (filterClasses != null && className !in filterClasses) continue
+                        
+                        // Skip if detecting this class
+                        if ((context.shouldDetectCars && className == "car") || 
+                            (context.shouldDetectChairs && className == "chair")) {
                             continue
                         }
+                        
                         val dilatedMask = dilateArray(mask)
                         obstacles.add(Obstacle(box, dilatedMask, className))
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error building mask for $className: ${e.message}", e)
+                    Log.e(TAG, "Error building YOLO26 mask: ${e.message}", e)
                 }
             }
+            
+            Log.d(TAG, "YOLO26 segmentation found ${obstacles.size} obstacles")
             return obstacles
+            
         } catch (e: Exception) {
-            Log.e(TAG, "Segmentation error: ${e.message}", e)
+            Log.e(TAG, "YOLO26 segmentation error: ${e.message}", e)
             return emptyList()
         }
     }
+    
+    /**
+     * Infer object class from aspect ratio and size (heuristic for YOLO26)
+     */
+    private fun inferClassFromAspectRatio(aspectRatio: Float, box: RectF, image: Bitmap): String {
+        val relativeWidth = box.width() / image.width
+        val relativeHeight = box.height() / image.height
+        val area = relativeWidth * relativeHeight
+        
+        return when {
+            // Doors are typically tall and rectangular
+            aspectRatio > 1.5f && aspectRatio < 3.5f && area > 0.05f -> "door"
+            // Chairs are roughly square to slightly tall
+            aspectRatio > 0.7f && aspectRatio < 1.8f && area < 0.2f -> "chair"
+            // Cars are wide and not very tall
+            aspectRatio < 0.8f && area > 0.1f -> "car"
+            // People are tall
+            aspectRatio > 1.5f && relativeHeight > 0.3f -> "person"
+            // Default to generic obstacle
+            else -> "obstacle"
+        }
+    }
+    
+    /**
+     * Smart segmentation - always uses YOLO26 with NPU acceleration
+     */
+    fun runSmartSegmentation(roi: Bitmap): List<Obstacle> {
+        return runYolo26Segmentation(roi)
+    }
 
+    /**
+     * Detect chairs using YOLO26 segmentation with class filtering
+     */
     private fun runSegmentationForChairs(roi: Bitmap): List<Obstacle> {
-        try {
-            val ti = TensorImage(DataType.FLOAT32).apply { load(roi) }
-            val input = imageProcessor.process(ti).buffer
-            val detShape = segInterpreter.getOutputTensor(0).shape()
-            val protoShape = segInterpreter.getOutputTensor(1).shape()
-            val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
-            val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
-            val outputs = mapOf(0 to detOut, 1 to protoOut)
-            segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
-            val raw = detOut[0]
-            val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
-            val numClasses = 80
-            val maskCoefsCount = detShape[1] - 4 - numClasses
-            val maskCoefsStartIdx = 4 + numClasses
-
-            for (i in 0 until detShape[2]) {
-                var maxClassProb = 0f
-                var maxClassIdx = -1
-                for (c in 0 until numClasses) {
-                    if (classNames[c] == "chair") {
-                        val prob = raw[4 + c][i]
-                        if (prob > maxClassProb) {
-                            maxClassProb = prob
-                            maxClassIdx = c
-                        }
-                    }
-                }
-                if (maxClassProb > threshold && maxClassIdx >= 0) {
-                    val cx = raw[0][i] * roi.width
-                    val cy = raw[1][i] * roi.height
-                    val ww = raw[2][i] * roi.width
-                    val hh = raw[3][i] * roi.height
-                    val box = RectF(cx - ww / 2, cy - hh / 2, cx + ww / 2, cy + hh / 2)
-                    val maskCoefs = FloatArray(maskCoefsCount) { c ->
-                        val idx = maskCoefsStartIdx + c
-                        if (idx < detShape[1]) raw[idx][i] else 0f
-                    }
-                    val className = classNames[maxClassIdx]
-                    dets += Triple(box, maskCoefs, className)
-                }
-            }
-
-            val finalDets = applyNMS(dets, 0.5f)
-            val obstacles = mutableListOf<Obstacle>()
-            val protoH = protoShape[1]
-            val protoW = protoShape[2]
-            val protoC = protoShape[3]
-
-            for ((box, coefs, className) in finalDets) {
-                try {
-                    val mask = Array(256) { FloatArray(256) }
-                    var activePixels = 0
-                    for (dy in 0 until 256) {
-                        for (dx in 0 until 256) {
-                            val py = (dy * protoH / 256).coerceIn(0, protoH - 1)
-                            val px = (dx * protoW / 256).coerceIn(0, protoW - 1)
-                            var maskValue = 0f
-                            for (c in 0 until minOf(coefs.size, protoC)) {
-                                maskValue += coefs[c] * protoOut[0][py][px][c]
-                            }
-                            maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.01f) {
-                                mask[dy][dx] = 1f
-                                activePixels++
-                            }
-                        }
-                    }
-                    if (activePixels >= 50) {
-                        val dilatedMask = dilateArray(mask)
-                        obstacles.add(Obstacle(box, dilatedMask, className))
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error building mask for $className: ${e.message}", e)
-                }
-            }
-            return obstacles
-        } catch (e: Exception) {
-            Log.e(TAG, "Chair segmentation error: ${e.message}", e)
-            return emptyList()
-        }
+        return runYolo26Segmentation(roi, listOf("chair"))
     }
 
+    /**
+     * Detect cars using YOLO26 segmentation with class filtering
+     */
     private fun runSegmentationForCars(roi: Bitmap): List<Obstacle> {
-        try {
-            val ti = TensorImage(DataType.FLOAT32).apply { load(roi) }
-            val input = imageProcessor.process(ti).buffer
-            val detShape = segInterpreter.getOutputTensor(0).shape()
-            val protoShape = segInterpreter.getOutputTensor(1).shape()
-            val detOut = Array(detShape[0]) { Array(detShape[1]) { FloatArray(detShape[2]) } }
-            val protoOut = Array(protoShape[0]) { Array(protoShape[1]) { Array(protoShape[2]) { FloatArray(protoShape[3]) } } }
-            val outputs = mapOf(0 to detOut, 1 to protoOut)
-            segInterpreter.runForMultipleInputsOutputs(arrayOf(input), outputs)
-            val raw = detOut[0]
-            val dets = mutableListOf<Triple<RectF, FloatArray, String>>()
-            val threshold = 0.5f
-            val numClasses = 80
-            val maskCoefsCount = detShape[1] - 4 - numClasses
-            val maskCoefsStartIdx = 4 + numClasses
-
-            for (i in 0 until detShape[2]) {
-                var maxClassProb = 0f
-                var maxClassIdx = -1
-                for (c in 0 until numClasses) {
-                    if (classNames[c] == "car") {
-                        val prob = raw[4 + c][i]
-                        if (prob > maxClassProb) {
-                            maxClassProb = prob
-                            maxClassIdx = c
-                        }
-                    }
-                }
-                if (maxClassProb > threshold && maxClassIdx >= 0) {
-                    val cx = raw[0][i] * roi.width
-                    val cy = raw[1][i] * roi.height
-                    val ww = raw[2][i] * roi.width
-                    val hh = raw[3][i] * roi.height
-                    val box = RectF(cx - ww / 2, cy - hh / 2, cx + ww / 2, cy + hh / 2)
-                    val maskCoefs = FloatArray(maskCoefsCount) { c ->
-                        val idx = maskCoefsStartIdx + c
-                        if (idx < detShape[1]) raw[idx][i] else 0f
-                    }
-                    val className = classNames[maxClassIdx]
-                    dets += Triple(box, maskCoefs, className)
-                }
-            }
-
-            val finalDets = applyNMS(dets, 0.5f)
-            val obstacles = mutableListOf<Obstacle>()
-            val protoH = protoShape[1]
-            val protoW = protoShape[2]
-            val protoC = protoShape[3]
-
-            for ((box, coefs, className) in finalDets) {
-                try {
-                    val mask = Array(256) { FloatArray(256) }
-                    var activePixels = 0
-                    for (dy in 0 until 256) {
-                        for (dx in 0 until 256) {
-                            val py = (dy * protoH / 256).coerceIn(0, protoH - 1)
-                            val px = (dx * protoW / 256).coerceIn(0, protoW - 1)
-                            var maskValue = 0f
-                            for (c in 0 until minOf(coefs.size, protoC)) {
-                                maskValue += coefs[c] * protoOut[0][py][px][c]
-                            }
-                            maskValue = 1.0f / (1.0f + exp(-maskValue))
-                            if (maskValue > 0.01f) {
-                                mask[dy][dx] = 1f
-                                activePixels++
-                            }
-                        }
-                    }
-                    if (activePixels >= 50) {
-                        val dilatedMask = dilateArray(mask)
-                        obstacles.add(Obstacle(box, dilatedMask, className))
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error building mask for $className: ${e.message}", e)
-                }
-            }
-            return obstacles
-        } catch (e: Exception) {
-            Log.e(TAG, "Car segmentation error: ${e.message}", e)
-            return emptyList()
-        }
+        return runYolo26Segmentation(roi, listOf("car"))
     }
 
     fun runDepthEstimation(bmp: Bitmap): Array<FloatArray> {
