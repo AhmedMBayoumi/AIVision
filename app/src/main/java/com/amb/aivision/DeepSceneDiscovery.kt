@@ -75,7 +75,7 @@ class DeepSceneDiscovery(private val context: Context) {
 
     fun start() {
         if (!initializationComplete) {
-            mainActivity.speak("Model is not ready yet")
+            mainActivity.voiceManager.speak("Model is not ready yet")
             return
         }
         isActive = true
@@ -85,7 +85,7 @@ class DeepSceneDiscovery(private val context: Context) {
             mainActivity.swipeInstructionTextView.text = "Swipe Down to Stop Detecting"
             mainActivity.swipeInstructionTextView.visibility = View.VISIBLE
         }
-        mainActivity.speak("Starting Deep Scene Discovery")
+        mainActivity.voiceManager.speak("Starting Deep Scene Discovery")
     }
 
     fun stop() {
@@ -194,7 +194,7 @@ class DeepSceneDiscovery(private val context: Context) {
                             if (isActive && finalResult.isNotEmpty()) {
                                 mainActivity.runOnUiThread {
                                     mainActivity.positionTextView.text = finalResult
-                                    mainActivity.speak(finalResult)
+                                    mainActivity.voiceManager.speak(finalResult)
                                 }
                             }
                             onSpeechFinished()
@@ -206,7 +206,7 @@ class DeepSceneDiscovery(private val context: Context) {
                     if (isActive) {
                         mainActivity.runOnUiThread {
                             mainActivity.positionTextView.text = "Error analyzing scene"
-                            mainActivity.speak("There was an error during analysis.")
+                            mainActivity.voiceManager.speak("There was an error during analysis.")
                         }
                     }
                     onSpeechFinished()

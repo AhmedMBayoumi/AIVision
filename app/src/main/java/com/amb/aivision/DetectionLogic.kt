@@ -43,12 +43,12 @@ class DetectionLogic(private val context: MainActivity) {
 
     // Adaptive parameters that adjust based on environment
     data class AdaptiveParams(
-        var detectionThreshold: Float = 0.45f,
+        var detectionThreshold: Float = 0.65f,
         var proximityThresholdClose: Float = 0.25f,  // meters for "you have reached"
         var proximityThresholdWarn: Float = 0.5f,    // meters for obstacle warning
         var iouThreshold: Float = 0.5f,
         var depthScaleFactor: Float = 100.0f,
-        var maskThreshold: Float = 0.5f
+        var maskThreshold: Float = 0.6f
     )
 
     private val params = AdaptiveParams()
@@ -91,6 +91,8 @@ class DetectionLogic(private val context: MainActivity) {
     private lateinit var yolo26Processor: ImageProcessor  // For YOLO26's 640x640 input
 
     private var numDetections: Int = 0
+    private val maskBuffer = Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) }
+    private val reusableMaskCoefs = FloatArray(YOLO26_MASK_COEFS)
 
 
     fun loadModels(): Boolean {
@@ -145,32 +147,33 @@ class DetectionLogic(private val context: MainActivity) {
                 return false
             }
 
-            // Try NNAPI first (leverages NPU on supported devices like Qualcomm, Samsung, MediaTek)
-            // NNAPI provides hardware acceleration and can use NPU, DSP, or GPU depending on device
+            // Try GPU delegate first (generally faster for float ops, works with int8 on many devices)
             var yolo26Loaded = false
-            try {
-                val nnapiOptions = Interpreter.Options().apply {
-                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
-                    useNNAPI = true  // Enable NNAPI for NPU/DSP acceleration
-                }
-                yolo26SegInterpreter = Interpreter(yolo26Model, nnapiOptions)
-                yolo26Loaded = true
-                Log.d(TAG, "YOLO26 loaded with NNAPI (NPU/DSP acceleration enabled)")
-            } catch (e: Exception) {
-                Log.w(TAG, "NNAPI failed for YOLO26: ${e.message}. Trying GPU delegate...")
-            }
-            
-            // Fallback to GPU delegate if NNAPI fails
-            if (!yolo26Loaded && compatList.isDelegateSupportedOnThisDevice) {
+            if (compatList.isDelegateSupportedOnThisDevice) {
                 try {
                     val gpuOptions = Interpreter.Options()
                     val gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(gpuDelegate)
                     yolo26SegInterpreter = Interpreter(yolo26Model, gpuOptions)
                     yolo26Loaded = true
-                    Log.d(TAG, "YOLO26 loaded with GPU delegate")
+                    Log.i(TAG, "✓ YOLO26 loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(TAG, "GPU delegate failed for YOLO26: ${e.message}. Falling back to CPU.")
+                    Log.w(TAG, "GPU delegate failed for YOLO26: ${e.message}. Trying NNAPI...")
+                }
+            }
+            
+            // Fallback to NNAPI (leverages NPU on supported devices)
+            if (!yolo26Loaded) {
+                try {
+                    val nnapiOptions = Interpreter.Options().apply {
+                        numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                        useNNAPI = true
+                    }
+                    yolo26SegInterpreter = Interpreter(yolo26Model, nnapiOptions)
+                    yolo26Loaded = true
+                    Log.i(TAG, "✓ YOLO26 loaded with NNAPI (NPU/DSP)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "NNAPI failed for YOLO26: ${e.message}. Falling back to CPU.")
                 }
             }
             
@@ -181,7 +184,7 @@ class DetectionLogic(private val context: MainActivity) {
                     useNNAPI = false
                 }
                 yolo26SegInterpreter = Interpreter(yolo26Model, cpuOptions)
-                Log.d(TAG, "YOLO26 loaded with CPU (multi-threaded)")
+                Log.i(TAG, "✓ YOLO26 loaded with CPU (multi-threaded)")
             }
 
             // Load Depth-Anything-V2 model (optimized for NPU via NNAPI)
@@ -195,31 +198,33 @@ class DetectionLogic(private val context: MainActivity) {
                 return false
             }
 
-            // Try NNAPI first for NPU acceleration
+            // Try GPU delegate first for Depth model (generally faster)
             var depthLoaded = false
-            try {
-                val nnapiOptions = Interpreter.Options().apply {
-                    numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
-                    useNNAPI = true
-                }
-                depthInterpreter = Interpreter(depthModel, nnapiOptions)
-                depthLoaded = true
-                Log.d(TAG, "Depth-Anything-V2 loaded with NNAPI (NPU acceleration)")
-            } catch (e: Exception) {
-                Log.w(TAG, "NNAPI failed for depth: ${e.message}. Trying GPU...")
-            }
-            
-            // Fallback to GPU delegate
-            if (!depthLoaded && compatList.isDelegateSupportedOnThisDevice) {
+            if (compatList.isDelegateSupportedOnThisDevice) {
                 try {
                     val gpuOptions = Interpreter.Options()
                     depthGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
                     gpuOptions.addDelegate(depthGpuDelegate)
                     depthInterpreter = Interpreter(depthModel, gpuOptions)
                     depthLoaded = true
-                    Log.d(TAG, "Depth-Anything-V2 loaded with GPU delegate")
+                    Log.i(TAG, "✓ Depth-Anything-V2 loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(TAG, "GPU delegate failed for depth: ${e.message}. Falling back to CPU.")
+                    Log.w(TAG, "GPU delegate failed for depth: ${e.message}. Trying NNAPI...")
+                }
+            }
+            
+            // Fallback to NNAPI
+            if (!depthLoaded) {
+                try {
+                    val nnapiOptions = Interpreter.Options().apply {
+                        numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                        useNNAPI = true
+                    }
+                    depthInterpreter = Interpreter(depthModel, nnapiOptions)
+                    depthLoaded = true
+                    Log.i(TAG, "✓ Depth-Anything-V2 loaded with NNAPI (NPU)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "NNAPI failed for depth: ${e.message}. Falling back to CPU.")
                 }
             }
             
@@ -230,7 +235,7 @@ class DetectionLogic(private val context: MainActivity) {
                     useNNAPI = false
                 }
                 depthInterpreter = Interpreter(depthModel, cpuOptions)
-                Log.d(TAG, "Depth-Anything-V2 loaded with CPU")
+                Log.i(TAG, "✓ Depth-Anything-V2 loaded with CPU (multi-threaded)")
             }
 
             return true
@@ -323,10 +328,10 @@ class DetectionLogic(private val context: MainActivity) {
                 val right = centerX + widthScaled / 2
                 val bottom = centerY + heightScaled / 2
                 val rect = RectF(left, top, right, bottom)
-                val normalizedX = centerX / bitmap.width
+                // Use raw normalized x directly (already in 0-1 range from YOLO output)
                 val position = when {
-                    normalizedX < 0.33 -> "left"
-                    normalizedX < 0.66 -> "mid"
+                    x < 0.33f -> "left"
+                    x < 0.66f -> "mid"
                     else -> "right"
                 }
                 detections.add(Triple(rect, confidence, position))
@@ -473,13 +478,20 @@ class DetectionLogic(private val context: MainActivity) {
                     }
                 }
             } else {
-                // Float32 output
+                // Float32 output - Model outputs NHWC format [1, 160, 160, 32]
                 val detFloatOut = Array(1) { Array(numSlots) { FloatArray(numFeatures) } }
-                val protoFloatOut = Array(1) { Array(YOLO26_MASK_COEFS) { Array(YOLO26_PROTO_SIZE) { FloatArray(YOLO26_PROTO_SIZE) } } }
+                val protoFloatOut = Array(1) { Array(YOLO26_PROTO_SIZE) { Array(YOLO26_PROTO_SIZE) { FloatArray(YOLO26_MASK_COEFS) } } }
                 val outputs = mapOf(0 to detFloatOut, 1 to protoFloatOut)
                 yolo26SegInterpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
                 detOut = detFloatOut[0]
-                protoOut = protoFloatOut[0]
+                // Transpose from NHWC [160, 160, 32] to internal format [32, 160, 160] for mask processing
+                protoOut = Array(YOLO26_MASK_COEFS) { c ->
+                    Array(YOLO26_PROTO_SIZE) { y ->
+                        FloatArray(YOLO26_PROTO_SIZE) { x ->
+                            protoFloatOut[0][y][x][c]
+                        }
+                    }
+                }
             }
             
             val obstacles = mutableListOf<Obstacle>()
@@ -499,11 +511,11 @@ class DetectionLogic(private val context: MainActivity) {
                 val conf2 = row[5]
                 val confidence = max(conf1, conf2)
                 
-                if (confidence <= threshold || confidence.isNaN() || !confidence.isFinite()) continue
+                if (confidence <= 0.6f || confidence.isNaN() || !confidence.isFinite()) continue
                 
-                // Get mask coefficients (32 values)
-                val maskCoefs = FloatArray(YOLO26_MASK_COEFS) { c ->
-                    if (6 + c < row.size) row[6 + c] else 0f
+                // Get mask coefficients (32 values) using reusable array
+                for (c in 0 until YOLO26_MASK_COEFS) {
+                    reusableMaskCoefs[c] = if (6 + c < row.size) row[6 + c] else 0f
                 }
                 
                 // Scale box to image coordinates
@@ -523,9 +535,19 @@ class DetectionLogic(private val context: MainActivity) {
                     box.bottom = min(roi.height.toFloat(), box.bottom)
                 }
                 
+                // Keep only top 8 confident detections to avoid processing too many masks
+                // This limit is crucial for performance - processing 100+ masks is too slow
+                if (obstacles.size >= 8) break
+
                 // Generate mask from proto and coefficients
                 try {
-                    val mask = Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) }
+                    // Reuse the class-level buffer instead of allocating new array every time
+                    // Reset buffer first
+                    for (i in 0 until PROCESSING_SIZE) {
+                        for (j in 0 until PROCESSING_SIZE) {
+                            maskBuffer[i][j] = 0f
+                        }
+                    }
                     var activePixels = 0
                     
                     for (dy in 0 until PROCESSING_SIZE) {
@@ -535,13 +557,13 @@ class DetectionLogic(private val context: MainActivity) {
                             
                             var maskValue = 0f
                             for (c in 0 until YOLO26_MASK_COEFS) {
-                                maskValue += maskCoefs[c] * protoOut[c][py][px]
+                                maskValue += reusableMaskCoefs[c] * protoOut[c][py][px]
                             }
                             // Apply sigmoid
                             maskValue = 1.0f / (1.0f + exp(-maskValue))
                             
                             if (maskValue > params.maskThreshold) {
-                                mask[dy][dx] = 1f
+                                maskBuffer[dy][dx] = 1f
                                 activePixels++
                             }
                         }
@@ -561,7 +583,7 @@ class DetectionLogic(private val context: MainActivity) {
                             continue
                         }
                         
-                        val dilatedMask = dilateArray(mask)
+                        val dilatedMask = dilateArray(maskBuffer)
                         obstacles.add(Obstacle(box, dilatedMask, className))
                     }
                 } catch (e: Exception) {
@@ -710,11 +732,25 @@ class DetectionLogic(private val context: MainActivity) {
         return if (cnt > 0) sum / cnt else Float.MAX_VALUE
     }
 
-    fun isObstacleInPath(obstacleBox: RectF, doorBox: RectF): Boolean {
-        val obstacleCenter = (obstacleBox.left + obstacleBox.right) / 2
-        val doorCenter = (doorBox.left + doorBox.right) / 2
-        val pathWidth = doorBox.width() * 1.75f
-        return abs(obstacleCenter - doorCenter) < pathWidth / 2
+    /**
+     * Check if an obstacle is blocking the path to the target.
+     * Uses horizontal overlap to determine if the obstacle intersects with the corridor
+     * from the user's position to the target.
+     */
+    fun isObstacleInPath(obstacleBox: RectF, targetBox: RectF, imageWidth: Float = 640f): Boolean {
+        // Define a path corridor from user to target
+        // The path is centered on the target and extends to cover a reasonable walking path
+        val targetCenter = (targetBox.left + targetBox.right) / 2
+        // Use a dynamic path width based on target width and image size
+        val pathHalfWidth = max(targetBox.width() * 1.5f, imageWidth * 0.25f)
+        val pathLeft = targetCenter - pathHalfWidth
+        val pathRight = targetCenter + pathHalfWidth
+        
+        // Check horizontal overlap: obstacle overlaps with the path corridor
+        val obstacleOverlapsHorizontally = obstacleBox.right > pathLeft && obstacleBox.left < pathRight
+        
+        // The obstacle must also be in front of us (we assume obstacles are detected in the path)
+        return obstacleOverlapsHorizontally
     }
 
     private fun cropBitmap(bitmap: Bitmap, rect: RectF): Bitmap {
