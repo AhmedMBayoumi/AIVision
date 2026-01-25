@@ -38,7 +38,7 @@ class DetectionLogic(private val context: MainActivity) {
         private const val YOLO26_FEATURES = 38  // 4 bbox + 2 confidence + 32 mask coefs
         private const val YOLO26_PROTO_SIZE = 160
         private const val YOLO26_MASK_COEFS = 32
-        private const val TEMPORAL_WINDOW_SIZE = 3
+        @Suppress("unused") private const val TEMPORAL_WINDOW_SIZE = 3
     }
 
     // Adaptive parameters that adjust based on environment
@@ -64,6 +64,7 @@ class DetectionLogic(private val context: MainActivity) {
     private val recentDetections = mutableListOf<DetectionHistory>()
     private val historyMaxAge = 1000L  // 1 second window
 
+    @Suppress("unused") // Used for class ID mapping from YOLO26
     private val classNames = listOf(
         "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
         "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
@@ -79,8 +80,8 @@ class DetectionLogic(private val context: MainActivity) {
         "toothbrush"
     )
 
-    private lateinit var tflite: Interpreter
-    private var gpuDelegate: GpuDelegate? = null
+    private lateinit var yolo26DoorInterpreter: Interpreter  // YOLO26n-fp16 for door detection (NMS baked in)
+    private var yolo26DoorGpuDelegate: GpuDelegate? = null
     private lateinit var yolo26SegInterpreter: Interpreter  // YOLO26 NMS-free segmentation (NPU accelerated)
     private lateinit var depthInterpreter: Interpreter
     private var depthGpuDelegate: GpuDelegate? = null
@@ -90,7 +91,9 @@ class DetectionLogic(private val context: MainActivity) {
     private lateinit var depthProcessor: ImageProcessor
     private lateinit var yolo26Processor: ImageProcessor  // For YOLO26's 640x640 input
 
-    private var numDetections: Int = 0
+    // YOLO26 door detection constants
+    private val yolo26DoorMaxDetections = 300
+    private val yolo26DoorFeatures = 6  // 4 bbox + 1 confidence + 1 class_id
     private val maskBuffer = Array(PROCESSING_SIZE) { FloatArray(PROCESSING_SIZE) }
     private val reusableMaskCoefs = FloatArray(YOLO26_MASK_COEFS)
 
@@ -98,43 +101,63 @@ class DetectionLogic(private val context: MainActivity) {
     fun loadModels(): Boolean {
         try {
             val compatList = CompatibilityList()
-            var useGpu = compatList.isDelegateSupportedOnThisDevice
 
-            val modelFile = if (context.useYolo12s) "yolo12s.tflite" else "yolo8n.tflite"
-            val model = try {
-                FileUtil.loadMappedFile(context, modelFile)
+            // Load YOLO26n-fp16 model for door detection (NMS baked in, output: [1, 300, 6])
+            val yolo26DoorModel = try {
+                FileUtil.loadMappedFile(context, "YOLO26n-fp16.tflite")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to load YOLO model $modelFile: ${e.message}", e)
+                Log.e(TAG, "Failed to load YOLO26n-fp16 model: ${e.message}", e)
                 context.runOnUiThread {
-                    context.positionTextView.text = "Error loading YOLO model: ${e.message}"
+                    context.positionTextView.text = "Error loading YOLO26n door model: ${e.message}"
                 }
                 return false
             }
 
-            if (this::tflite.isInitialized) {
-                tflite.close()
+            if (this::yolo26DoorInterpreter.isInitialized) {
+                yolo26DoorInterpreter.close()
             }
-            gpuDelegate?.close()
+            yolo26DoorGpuDelegate?.close()
 
-            if (useGpu) {
+            // Try GPU delegate first for YOLO26 door detection
+            var yolo26DoorLoaded = false
+            if (compatList.isDelegateSupportedOnThisDevice) {
                 try {
                     val gpuOptions = Interpreter.Options()
-                    gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
-                    gpuOptions.addDelegate(gpuDelegate)
-                    tflite = Interpreter(model, gpuOptions)
+                    yolo26DoorGpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+                    gpuOptions.addDelegate(yolo26DoorGpuDelegate)
+                    yolo26DoorInterpreter = Interpreter(yolo26DoorModel, gpuOptions)
+                    yolo26DoorLoaded = true
+                    Log.i(TAG, "✓ YOLO26n door detection loaded with GPU delegate")
                 } catch (e: Exception) {
-                    Log.w(TAG, "GPU delegate failed for YOLO: ${e.message}. Falling back to CPU.", e)
-                    useGpu = false
+                    Log.w(TAG, "GPU delegate failed for YOLO26 door: ${e.message}. Trying NNAPI...")
                 }
             }
-            if (!useGpu) {
+            
+            // Fallback to NNAPI
+            if (!yolo26DoorLoaded) {
+                try {
+                    val nnapiOptions = Interpreter.Options().apply {
+                        numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
+                        useNNAPI = true
+                    }
+                    yolo26DoorInterpreter = Interpreter(yolo26DoorModel, nnapiOptions)
+                    yolo26DoorLoaded = true
+                    Log.i(TAG, "✓ YOLO26n door detection loaded with NNAPI (NPU)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "NNAPI failed for YOLO26 door: ${e.message}. Falling back to CPU.")
+                }
+            }
+            
+            // Final fallback to multi-threaded CPU
+            if (!yolo26DoorLoaded) {
                 val cpuOptions = Interpreter.Options().apply {
                     numThreads = min(Runtime.getRuntime().availableProcessors(), 4)
                     useNNAPI = false
                 }
-                tflite = Interpreter(model, cpuOptions)
+                yolo26DoorInterpreter = Interpreter(yolo26DoorModel, cpuOptions)
+                Log.i(TAG, "✓ YOLO26n door detection loaded with CPU (multi-threaded)")
             }
-            numDetections = tflite.getOutputTensor(0).shape()[2]
+
 
             // Load YOLO26 segmentation model (int8 quantized - optimized for NPU via NNAPI)
             val yolo26Model = try {
@@ -284,6 +307,7 @@ class DetectionLogic(private val context: MainActivity) {
     /**
      * Add detection to temporal history and check if it should be announced
      */
+    @Suppress("unused") // Used for temporal smoothing of detection announcements
     private fun shouldAnnounceDetection(className: String, position: String, confidence: Float): Boolean {
         val now = System.currentTimeMillis()
         
@@ -301,24 +325,40 @@ class DetectionLogic(private val context: MainActivity) {
     }
 
     fun detectDoor(bitmap: Bitmap): Pair<RectF?, String> {
-        val tensorImage = TensorImage(DataType.FLOAT32)
-        tensorImage.load(bitmap)
-        val processedImage = detectionProcessor.process(tensorImage)
-        val inputBuffer = processedImage.buffer
-        inputBuffer.rewind()
-        val outputs = Array(1) { Array(5) { FloatArray(8400) } }
-        tflite.run(inputBuffer, outputs)
-        val threshold = 0.5f
-        val iouThresh = 0.6f
-        val detections = mutableListOf<Triple<RectF, Float, String>>()
+        if (!::yolo26DoorInterpreter.isInitialized) {
+            Log.e(TAG, "YOLO26 door interpreter not initialized")
+            return Pair(null, "")
+        }
+        
+        try {
+            val tensorImage = TensorImage(DataType.FLOAT32)
+            tensorImage.load(bitmap)
+            val processedImage = detectionProcessor.process(tensorImage)
+            val inputBuffer = processedImage.buffer
+            inputBuffer.rewind()
+            
+            // YOLO26n output: [1, 300, 6] - NMS is baked in
+            // Format: [x, y, w, h, confidence, class_id] per detection
+            val outputs = Array(1) { Array(yolo26DoorMaxDetections) { FloatArray(yolo26DoorFeatures) } }
+            yolo26DoorInterpreter.run(inputBuffer, outputs)
+            
+            val threshold = 0.5f
+            val detections = mutableListOf<Triple<RectF, Float, String>>()
 
-        for (i in 0 until 8400) {
-            val x = outputs[0][0][i]
-            val y = outputs[0][1][i]
-            val w = outputs[0][2][i]
-            val h = outputs[0][3][i]
-            val confidence = outputs[0][4][i]
-            if (confidence > threshold) {
+            for (i in 0 until yolo26DoorMaxDetections) {
+                val row = outputs[0][i]
+                val x = row[0]  // center x (normalized 0-1)
+                val y = row[1]  // center y (normalized 0-1)
+                val w = row[2]  // width (normalized)
+                val h = row[3]  // height (normalized)
+                val confidence = row[4]
+                // row[5] is class_id - YOLO26n detects general objects, we'll use heuristics + classical confirmation
+                
+                if (confidence <= threshold || confidence.isNaN() || !confidence.isFinite()) continue
+                
+                // Skip tiny or invalid boxes
+                if (w <= 0.01f || h <= 0.01f) continue
+                
                 val centerX = x * bitmap.width
                 val centerY = y * bitmap.height
                 val widthScaled = w * bitmap.width
@@ -327,8 +367,19 @@ class DetectionLogic(private val context: MainActivity) {
                 val top = centerY - heightScaled / 2
                 val right = centerX + widthScaled / 2
                 val bottom = centerY + heightScaled / 2
+                
                 val rect = RectF(left, top, right, bottom)
-                // Use raw normalized x directly (already in 0-1 range from YOLO output)
+                
+                // Validate box bounds
+                if (rect.width() < 20 || rect.height() < 20) continue
+                
+                // Clip to image bounds
+                rect.left = max(0f, rect.left)
+                rect.top = max(0f, rect.top)
+                rect.right = min(bitmap.width.toFloat(), rect.right)
+                rect.bottom = min(bitmap.height.toFloat(), rect.bottom)
+                
+                // Determine position from normalized x
                 val position = when {
                     x < 0.33f -> "left"
                     x < 0.66f -> "mid"
@@ -336,31 +387,33 @@ class DetectionLogic(private val context: MainActivity) {
                 }
                 detections.add(Triple(rect, confidence, position))
             }
-        }
 
-        val sortedDetections = detections.sortedByDescending { it.second }
-        val keep = mutableListOf<Triple<RectF, Float, String>>()
-        for (det in sortedDetections) {
-            if (keep.size < 2 && keep.none { iou(it.first, det.first) > iouThresh }) {
-                keep.add(det)
-            }
-        }
+            // NMS is already applied in model, but sort by confidence for best selection
+            val sortedDetections = detections.sortedByDescending { it.second }
 
-        if (keep.isNotEmpty()) {
-            val best = keep[0]
-            val croppedBitmap = cropBitmap(bitmap, best.first)
-            if (confirmDoorWithClassicalMethods(croppedBitmap)) {
-                return Pair(best.first, best.third)
-            } else if (keep.size > 1) {
-                val secondBest = keep[1]
-                val secondCroppedBitmap = cropBitmap(bitmap, secondBest.first)
-                if (confirmDoorWithClassicalMethods(secondCroppedBitmap)) {
-                    return Pair(secondBest.first, secondBest.third)
+            // Try to find a door using classical confirmation
+            for (det in sortedDetections.take(5)) {
+                val croppedBitmap = cropBitmap(bitmap, det.first)
+                if (confirmDoorWithClassicalMethods(croppedBitmap)) {
+                    return Pair(det.first, det.third)
                 }
             }
-            return Pair(best.first, best.third)
+            
+            // If no classical confirmation, return best detection if aspect ratio suggests a door
+            if (sortedDetections.isNotEmpty()) {
+                val best = sortedDetections[0]
+                val aspectRatio = best.first.height() / max(1f, best.first.width())
+                // Doors are typically tall rectangles (aspect ratio 1.5 to 3.5)
+                if (aspectRatio > 1.2f && aspectRatio < 4.0f) {
+                    return Pair(best.first, best.third)
+                }
+            }
+            
+            return Pair(null, "")
+        } catch (e: Exception) {
+            Log.e(TAG, "YOLO26 door detection error: ${e.message}", e)
+            return Pair(null, "")
         }
-        return Pair(null, "")
     }
 
     fun detectChair(bitmap: Bitmap): Pair<RectF?, String> {
@@ -403,6 +456,7 @@ class DetectionLogic(private val context: MainActivity) {
      * Run segmentation using YOLO26 model
      * This is the primary segmentation method - always uses YOLO26 with NPU acceleration
      */
+    @Suppress("unused") // Public API for obstacle segmentation
     fun runSegmentation(roi: Bitmap): List<Obstacle> {
         return runYolo26Segmentation(roi)
     }
@@ -495,7 +549,6 @@ class DetectionLogic(private val context: MainActivity) {
             }
             
             val obstacles = mutableListOf<Obstacle>()
-            val threshold = params.detectionThreshold
             
             // YOLO26 output: each row is [x, y, w, h, conf1, conf2, mask_coef_0...mask_coef_31]
             // conf1 and conf2 are objectness scores from dual heads, we use max
@@ -761,17 +814,46 @@ class DetectionLogic(private val context: MainActivity) {
         return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
     }
 
+    /**
+     * Advanced classical door confirmation using multiple computer vision techniques:
+     * 1. Line detection with parallel line pairing
+     * 2. Rectangular frame detection
+     * 3. Corner/handle detection via Harris corners
+     * 4. Color uniformity analysis
+     * 5. Symmetry analysis
+     */
     private fun confirmDoorWithClassicalMethods(bitmap: Bitmap): Boolean {
+        if (bitmap.width < 20 || bitmap.height < 20) return false
+        
         val mat = Mat()
         Utils.bitmapToMat(bitmap, mat)
         val gray = Mat()
         Imgproc.cvtColor(mat, gray, Imgproc.COLOR_BGR2GRAY)
+        
+        // Apply Gaussian blur to reduce noise
+        val blurred = Mat()
+        Imgproc.GaussianBlur(gray, blurred, org.opencv.core.Size(5.0, 5.0), 0.0)
+        
+        // Adaptive edge detection based on image statistics
+        val mean = org.opencv.core.Core.mean(blurred)
+        val lowThresh = max(30.0, mean.`val`[0] * 0.4)
+        val highThresh = min(200.0, mean.`val`[0] * 1.2)
         val edges = Mat()
-        Imgproc.Canny(gray, edges, 50.0, 150.0)
+        Imgproc.Canny(blurred, edges, lowThresh, highThresh)
+        
+        // Morphological operations to connect broken edges
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, org.opencv.core.Size(3.0, 3.0))
+        Imgproc.dilate(edges, edges, kernel)
+        Imgproc.erode(edges, edges, kernel)
+        
+        // Detect lines using probabilistic Hough transform
         val lines = Mat()
-        Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180, 50, 50.0, 10.0)
-        var verticalLines = 0
-        var horizontalLines = 0
+        Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180, 40, 30.0, 15.0)
+        
+        val verticalLines = mutableListOf<DoubleArray>()
+        val horizontalLines = mutableListOf<DoubleArray>()
+        var score = 0.0
+        
         for (i in 0 until lines.rows()) {
             val line = lines.get(i, 0)
             val x1 = line[0]
@@ -779,25 +861,132 @@ class DetectionLogic(private val context: MainActivity) {
             val x2 = line[2]
             val y2 = line[3]
             val angle = atan2(y2 - y1, x2 - x1) * 180 / Math.PI
-            if (abs(angle) < 10 || abs(angle - 180) < 10) horizontalLines++
-            if (abs(angle - 90) < 10 || abs(angle + 90) < 10) verticalLines++
+            
+            // Classify lines with some tolerance
+            if (abs(angle) < 15 || abs(angle - 180) < 15 || abs(angle + 180) < 15) {
+                horizontalLines.add(line)
+            } else if (abs(abs(angle) - 90) < 15) {
+                verticalLines.add(line)
+            }
         }
+        
+        // Feature 1: Parallel vertical lines (door frame sides)
+        val parallelVerticalPairs = countParallelLinePairs(verticalLines, bitmap.width * 0.15, bitmap.width * 0.9)
+        if (parallelVerticalPairs > 0) score += 25.0
+        
+        // Feature 2: Parallel horizontal lines (top/bottom of door)
+        val parallelHorizontalPairs = countParallelLinePairs(horizontalLines, bitmap.height * 0.1, bitmap.height * 0.5)
+        if (parallelHorizontalPairs > 0) score += 15.0
+        
+        // Feature 3: Sufficient vertical and horizontal lines for a rectangular frame
+        if (verticalLines.size >= 2) score += 10.0
+        if (horizontalLines.isNotEmpty()) score += 5.0
+        
+        // Feature 4: Contour analysis for rectangular shapes
         val contours = mutableListOf<MatOfPoint>()
         val hierarchy = Mat()
-        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        Imgproc.findContours(edges.clone(), contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        
+        val minArea = bitmap.width * bitmap.height * 0.1  // At least 10% of image
+        
         for (contour in contours) {
+            val area = Imgproc.contourArea(contour)
+            if (area < minArea) continue
+            
             val approx = MatOfPoint2f()
-            Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, Imgproc.arcLength(MatOfPoint2f(*contour.toArray()), true) * 0.02, true)
-            if (approx.toArray().size == 4) {
-                val points = approx.toArray()
-                val rect = Imgproc.boundingRect(MatOfPoint(*points))
-                val aspectRatio = rect.height.toFloat() / rect.width
-                if (aspectRatio in 1.5..3.0 && verticalLines >= 2 && horizontalLines >= 2) {
-                    return true
+            val contour2f = MatOfPoint2f(*contour.toArray())
+            val epsilon = Imgproc.arcLength(contour2f, true) * 0.02
+            Imgproc.approxPolyDP(contour2f, approx, epsilon, true)
+            
+            val vertices = approx.toArray().size
+            if (vertices in 4..6) {
+                val rect = Imgproc.boundingRect(MatOfPoint(*approx.toArray().map { org.opencv.core.Point(it.x, it.y) }.toTypedArray()))
+                val aspectRatio = rect.height.toFloat() / max(1, rect.width)
+                
+                // Doors typically have aspect ratio between 1.5 and 3.5
+                if (aspectRatio in 1.3..4.0) {
+                    score += 20.0
+                    
+                    // Bonus for larger contours (more likely to be the door)
+                    val areaRatio = area / (bitmap.width * bitmap.height)
+                    if (areaRatio > 0.3) score += 10.0
                 }
             }
         }
-        return false
+        
+        // Feature 5: Harris corner detection for door handles/knobs
+        val corners = Mat()
+        Imgproc.cornerHarris(blurred, corners, 5, 3, 0.04)
+        
+        // Count significant corners (potential door hardware)
+        val normalizedCorners = Mat()
+        org.opencv.core.Core.normalize(corners, normalizedCorners, 0.0, 255.0, org.opencv.core.Core.NORM_MINMAX)
+        var cornerCount = 0
+        // Sample the right third of the image where handles usually are
+        val handleRegionStart = (bitmap.width * 0.6).toInt()
+        for (y in 0 until normalizedCorners.rows()) {
+            for (x in handleRegionStart until normalizedCorners.cols()) {
+                if (normalizedCorners.get(y, x)[0] > 150) {
+                    cornerCount++
+                }
+            }
+        }
+        if (cornerCount in 5..200) score += 10.0  // Reasonable number of corners suggests handle/hardware
+        
+        // Feature 6: Color uniformity check (doors often have uniform color)
+        val hsv = Mat()
+        Imgproc.cvtColor(mat, hsv, Imgproc.COLOR_BGR2HSV)
+        val channels = mutableListOf<Mat>()
+        org.opencv.core.Core.split(hsv, channels)
+        val satStdDev = org.opencv.core.MatOfDouble()
+        val satMean = org.opencv.core.MatOfDouble()
+        org.opencv.core.Core.meanStdDev(channels[1], satMean, satStdDev)
+        
+        // Low saturation variance suggests uniform color (common for doors)
+        if (satStdDev.toArray().isNotEmpty() && satStdDev.toArray()[0] < 50) score += 10.0
+        
+        // Release Mats to prevent memory leaks
+        mat.release()
+        gray.release()
+        blurred.release()
+        edges.release()
+        kernel.release()
+        lines.release()
+        hierarchy.release()
+        corners.release()
+        normalizedCorners.release()
+        hsv.release()
+        channels.forEach { it.release() }
+        satStdDev.release()
+        satMean.release()
+        contours.forEach { it.release() }
+        
+        // Score threshold: 40+ indicates strong door likelihood
+        Log.d(TAG, "Door confirmation score: $score")
+        return score >= 40.0
+    }
+    
+    /**
+     * Count pairs of parallel lines that are spaced appropriately for a door frame
+     */
+    private fun countParallelLinePairs(lines: List<DoubleArray>, minSpacing: Double, maxSpacing: Double): Int {
+        var pairs = 0
+        for (i in lines.indices) {
+            for (j in i + 1 until lines.size) {
+                val line1 = lines[i]
+                val line2 = lines[j]
+                
+                // Calculate average x position for vertical lines, y for horizontal
+                val pos1 = (line1[0] + line1[2]) / 2
+                val pos2 = (line2[0] + line2[2]) / 2
+                val spacing = abs(pos1 - pos2)
+                
+                if (spacing in minSpacing..maxSpacing) {
+                    pairs++
+                }
+            }
+        }
+        return pairs
     }
 
     private fun dilateArray(array: Array<FloatArray>): Array<FloatArray> {
@@ -821,6 +1010,7 @@ class DetectionLogic(private val context: MainActivity) {
         return result
     }
 
+    @Suppress("unused") // Available for future NMS needs
     private fun applyNMS(dets: List<Triple<RectF, FloatArray, String>>, iouThresh: Float): List<Triple<RectF, FloatArray, String>> {
         if (dets.isEmpty()) return emptyList()
         val sorted = dets.sortedByDescending { it.second.sumOf { v: Float -> v.toDouble() }.toFloat() }

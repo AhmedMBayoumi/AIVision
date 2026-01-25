@@ -111,7 +111,6 @@ class MainActivity : AppCompatActivity() {
     var shouldDetect = false
     private var isDeepSceneDiscoveryActive = false
     private var canProcess = true
-    var useYolo12s = false  // Use yolo8n by default for better performance
     private var isFirstLaunch = true
     private var initialOfflineWarningSent = false
     private var hasGreeted = false
@@ -791,9 +790,9 @@ class MainActivity : AppCompatActivity() {
             var extraRotation = 0f
             if (uiRotation == Surface.ROTATION_0) {
                  if (deviceOrientationDegrees in 45..135) { // Landscape Right (90)
-                     extraRotation = 270f // or -90
+                     extraRotation = 90f  // Fixed: was 270f, swapped direction
                  } else if (deviceOrientationDegrees in 225..315) { // Landscape Left (270)
-                     extraRotation = 90f
+                     extraRotation = 270f  // Fixed: was 90f, swapped direction
                  }
             }
             
